@@ -696,6 +696,11 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         self._post_inject_watch = 0
         self._post_inject_silent = 0
         self._post_inject_text = 0
+        # Incremented by the GPU producer's _enqueue_audio. Snapshotted at
+        # injection time so the watchdog can report how many audio packets
+        # actually left the engine while the model was speaking.
+        self.audio_packets_enqueued = 0
+        self._post_inject_audio_pkts0 = 0
 
     def _inject_tokens(self, tokens: list[int]) -> None:
         """Force-feed text tokens via the PUBLIC lm_gen.step() (not the
@@ -1211,15 +1216,29 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
 
             # --- A search is happening: only now does the model get told to
             # wait. Injection itself must happen on the GPU thread. ---
-            # Same rule as the <ref> block below: the <lookup> tag is only
-            # meaningful to the adapter trained on it. Without that adapter the
-            # tag is just two more tokens for the model to read aloud, so the
-            # plain sentence is used instead.
-            lookup_text = (
-                search_helpers.wrap_with_lookup_tags()
-                if self.ref_lora_active else "Please wait a minute."
-            )
-            self.pending_lookup_tokens = self.tokenizer.encode(lookup_text)
+            # The <lookup> filler is OFF by default, because the model reads it
+            # out loud.
+            #
+            # conversation_logs_7 caught this directly: turn 6's entire spoken
+            # reply was "Please wait a minute." and turn 7's was "Please wait a
+            # minute The current Tesla stock is $309.32." -- the filler text
+            # coming back as speech instead of acting as a stall instruction.
+            # It became audible once the injection stopped force-silencing the
+            # assistant's audio stream (r10): the model now voices what it is
+            # fed, so feeding it a sentence makes it say that sentence.
+            #
+            # Nothing is lost by skipping it. The wait is already covered twice
+            # over -- the thinking sound plays, and suppress_text_until_ref
+            # holds the model's words until the <ref> lands. Set
+            # LOOKUP_INJECT_ENABLED=1 to restore it.
+            if os.environ.get("LOOKUP_INJECT_ENABLED", "0").strip() == "1":
+                lookup_text = (
+                    search_helpers.wrap_with_lookup_tags()
+                    if self.ref_lora_active else "Please wait a minute."
+                )
+                self.pending_lookup_tokens = self.tokenizer.encode(lookup_text)
+            else:
+                self.pending_lookup_tokens = None
 
             hits: list[dict] = []
             if not self.web_search_enabled:
@@ -1644,6 +1663,7 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
             self._post_inject_watch = self._POST_INJECT_WATCH_FRAMES
             self._post_inject_silent = 0
             self._post_inject_text = 0
+            self._post_inject_audio_pkts0 = self.audio_packets_enqueued
             # The grounded answer starts HERE, not where the user began speaking.
             # PersonaPlex is full-duplex and murmurs a guess while the question
             # is still being asked -- conversation_logs_3 logged "Hmm, the stock
@@ -1880,7 +1900,27 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
                 self._post_inject_text += 1
             if self._post_inject_watch == 0:
                 spoke = self._POST_INJECT_WATCH_FRAMES - self._post_inject_silent
-                if spoke == 0 and self._post_inject_text > 0:
+                pkts = self.audio_packets_enqueued - self._post_inject_audio_pkts0
+                # Three distinguishable outcomes, each needing a different fix:
+                #   text=0             -> the model had nothing to say
+                #   text>0, spoke=0    -> generated silence (an LM-side fault)
+                #   spoke>0, pkts=0    -> voiced it, but nothing was delivered
+                # At 25fps, `spoke` Mimi frames (80ms) should yield roughly
+                # spoke*2 audio packets.
+                if spoke > 0 and pkts == 0:
+                    print(
+                        f"[liveTryPlasticity][search] AUDIO NOT DELIVERED: the model voiced "
+                        f"{spoke} frame(s) after the <ref> but zero audio packets were queued "
+                        f"for the browser. The fault is in the delivery path, not the model.",
+                        flush=True,
+                    )
+                    self.conv_logger.event(
+                        "audio_not_delivered",
+                        f"spoke_frames={spoke} packets=0 text={self._post_inject_text}",
+                        spoken_frames=spoke, audio_packets=0,
+                        text_tokens=self._post_inject_text,
+                    )
+                elif spoke == 0 and self._post_inject_text > 0:
                     print(
                         f"[liveTryPlasticity][search] MUTE AFTER INJECTION: the model emitted "
                         f"{self._post_inject_text} text token(s) but no audio above "
@@ -1899,10 +1939,17 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
                         watched_frames=self._POST_INJECT_WATCH_FRAMES,
                     )
                 else:
+                    print(
+                        f"[liveTryPlasticity][search] post-injection voice: {spoke} spoken "
+                        f"frame(s), {self._post_inject_text} text token(s), {pkts} audio "
+                        f"packet(s) queued for the browser",
+                        flush=True,
+                    )
                     self.conv_logger.event(
                         "voice_after_injection",
-                        f"audio_frames={spoke} text={self._post_inject_text}",
+                        f"audio_frames={spoke} text={self._post_inject_text} packets={pkts}",
                         audio_frames=spoke, text_tokens=self._post_inject_text,
+                        audio_packets=pkts,
                     )
 
         # First real audio of this turn -> the honest end-to-end latency.
@@ -3884,6 +3931,14 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                         print(f"[GPU] WARNING frame_q.put failed: {e!r}", flush=True)
 
                 def _enqueue_audio(pkt: dict) -> None:
+                    # Counted so the post-injection watchdog can separate "the
+                    # model never spoke" from "the model spoke and the audio
+                    # never reached the browser". Those need opposite fixes, and
+                    # without this counter the conversation log cannot tell them
+                    # apart -- only the server log could, and that is not always
+                    # to hand.
+                    if reply_engine is not None:
+                        reply_engine.audio_packets_enqueued += 1
                     fut = asyncio.run_coroutine_threadsafe(audio_q.put(pkt), event_loop)
                     try:
                         fut.result(timeout=FRAME_Q_PUT_TIMEOUT_S)

@@ -99,4 +99,49 @@ assert "sampled_audio_tokens" in proc and "~state.provided" in proc, \
     "unprovided audio positions must be filled from sampled tokens"
 print("[ok] 7. None leaves the positions unprovided, so they are filled by sampling")
 
+
+# ======================= part D: the filler must not be read aloud (logs_7)
+print("\n-- part D: the <lookup> filler --")
+
+route = next(n for n in ast.walk(tree)
+             if isinstance(n, ast.FunctionDef) and n.name == "_route_and_search")
+route_src = ast.get_source_segment(server_src, route)
+
+# conversation_logs_7 turn 6 spoke ONLY the filler:
+#     SAID "Please wait a minute."
+# and turn 7 spoke it before the answer:
+#     SAID "Please wait a minute The current Tesla stock is $309.32."
+# Once the assistant's audio stream was freed (r10) the model voices whatever
+# it is fed, so feeding it a sentence makes it say that sentence.
+assert "LOOKUP_INJECT_ENABLED" in route_src, "the filler injection must be switchable"
+m = re.search(r'LOOKUP_INJECT_ENABLED",\s*"0"', route_src)
+assert m, "the filler must default OFF"
+assert "self.pending_lookup_tokens = None" in route_src, \
+    "with the filler off, nothing may be queued for injection"
+print("[ok] 8. the <lookup> filler is off by default and no longer spoken back")
+
+# The wait is still covered: thinking sound + text suppression.
+assert "_start_thinking_sound" in server_src and "suppress_text_until_ref" in server_src
+print("[ok] 9. the wait is still covered by the thinking sound and the text hold")
+
+
+# =================== part E: tell 'never spoke' from 'never delivered' (logs_7)
+print("\n-- part E: which side of the pipeline failed --")
+
+step = ast.get_source_segment(server_src, next(
+    n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_step"))
+assert "AUDIO NOT DELIVERED" in step and "MUTE AFTER INJECTION" in step, \
+    "the watchdog must name both failure modes separately"
+assert "audio_packets_enqueued" in server_src
+assert "self._post_inject_audio_pkts0" in step, \
+    "the packet count must be snapshotted at injection time"
+print("[ok] 10. the watchdog separates 'model never spoke' from 'audio never delivered'")
+
+# The counter has to be incremented where packets really leave the engine.
+assert "reply_engine.audio_packets_enqueued += 1" in server_src
+enq = server_src[server_src.index("def _enqueue_audio"):]
+enq = enq[:enq.index("if prebuffer_chunks")]
+assert "audio_packets_enqueued += 1" in enq, "count inside _enqueue_audio, not elsewhere"
+print("[ok] 11. the counter increments inside _enqueue_audio itself")
+
 print("\nAll injection-stream checks passed.")
