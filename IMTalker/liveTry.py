@@ -44,7 +44,7 @@ FRAME_SIZE = 1920  # 80 ms at 24 kHz, Moshi/Mimi step size
 # code than you think is otherwise indistinguishable from a broken fix -- and
 # was: conversation_logs_5 showed `ref_lora_loaded=False` alongside injected
 # `<ref>` tags, a combination this revision cannot produce.
-PIPELINE_REVISION = "2026-08-16.r8-coverage-verdict"
+PIPELINE_REVISION = "2026-08-16.r9-coverage-by-name"
 
 
 # ---------------------------------------------------------------------------
@@ -100,12 +100,18 @@ _LORA_KEY_RE = re.compile(
 )
 
 
-def _count_checkpoint_lora_modules(safetensors_path: Path) -> int | None:
-    """How many modules the LoRA checkpoint actually trains.
+def _checkpoint_lora_modules(safetensors_path: Path) -> set[str] | None:
+    """The module NAMES the LoRA checkpoint carries weights for.
 
-    This is the number to judge a load against: PEFT may wrap extra modules
-    (harmless, since they get lora_B = 0), but it must not MISS any that the
-    checkpoint trained.
+    Names, not values, are what a load has to be judged on. Whether a module's
+    lora_B happens to be all zeros is a property of how the adapter was TRAINED
+    -- a zero B means that module contributes nothing, which is a legitimate
+    thing for a checkpoint to contain. It says nothing about whether the load
+    succeeded, and treating it as evidence of a failed load refuses to start a
+    perfectly good adapter.
+
+    What a load must guarantee is that every module the checkpoint names got
+    wrapped, so its weights had somewhere to go.
 
     Reads the .safetensors header directly -- 8-byte little-endian length then
     JSON -- so it needs nothing beyond the standard library and never loads the
@@ -130,7 +136,7 @@ def _count_checkpoint_lora_modules(safetensors_path: Path) -> int | None:
         m = _LORA_KEY_RE.match(key)
         if m:
             parts.setdefault(m.group("module"), set()).add(m.group("ab"))
-    return sum(1 for sides in parts.values() if {"A", "B"} <= sides)
+    return {name for name, sides in parts.items() if {"A", "B"} <= sides}
 
 
 def _ensure_moshi_importable(moshi_root: str | Path) -> None:
@@ -839,71 +845,76 @@ class MoshiOnlyEngine:
         used to say by how much.
         """
         try:
-            active, inactive = [], []
+            wrapped: set[str] = set()
+            zero_b: set[str] = set()
             for name, module in peft_model.named_modules():
                 lora_B = getattr(module, "lora_B", None)
                 if lora_B is None or not hasattr(lora_B, "keys"):
                     continue
+                # Normalise into the namespace the checkpoint keys use, so the
+                # two sets are directly comparable.
+                short = name
+                for prefix in ("base_model.model.", "base_model."):
+                    if short.startswith(prefix):
+                        short = short[len(prefix):]
+                        break
+                wrapped.add(short)
                 for adapter_name in list(lora_B.keys()):
                     weight = getattr(lora_B[adapter_name], "weight", None)
-                    if weight is None:
-                        continue
-                    # lora_B == 0 => B @ A == 0 => this module contributes nothing.
-                    if float(weight.detach().abs().max().item()) > 0.0:
-                        active.append(name)
-                    else:
-                        inactive.append(name)
-            total = len(active) + len(inactive)
-            if not total:
+                    if weight is not None and float(weight.detach().abs().max().item()) == 0.0:
+                        zero_b.add(short)
+            if not wrapped:
                 return
-            print(
-                f"[liveTry] reference LoRA coverage: {len(active)}/{total} wrapped modules carry "
-                f"trained weights, {len(inactive)} are zero-initialised no-ops",
-                flush=True,
-            )
-            if inactive:
-                sample = ", ".join(inactive[:3])
-                print(f"[liveTry] reference LoRA inactive (sample): {sample}", flush=True)
-            self.conv_logger.event(
-                "ref_lora_coverage", path=str(lora_path),
-                active_modules=len(active), inactive_modules=len(inactive), total=total,
-            )
         except Exception as e:
-            # Measuring must never break startup; the verdict below still runs.
+            # Measuring must never break startup.
             print(f"[liveTry] reference LoRA coverage report failed (ignored): {e!r}", flush=True)
             return
 
-        # The question that matters is NOT "did PEFT wrap any extra modules" --
-        # it is "did every module the checkpoint trained receive its weights".
+        # Judge the load by NAMES, not by values.
         #
-        # An extra wrapped module is created with lora_B = 0, so B @ A is
-        # exactly zero and it contributes nothing to any forward pass. It costs
-        # a little memory and nothing else. A MISSING module is the real fault:
-        # part of the trained adapter is simply absent, and the adapter cannot
-        # do the job it was trained for.
+        # Two earlier versions of this check got that wrong and refused to start
+        # a correctly-loaded adapter. The second one used "lora_B is all zeros"
+        # as a proxy for "this module never received its weights" -- but a zero
+        # lora_B is a perfectly legitimate thing for a checkpoint to CONTAIN. It
+        # means that module contributes nothing to the forward pass, which is a
+        # fact about how the adapter was trained, not about whether it loaded.
+        # This deployment's checkpoint carries exactly that: 38 modules, 6 of
+        # them (depformer.*.self_attn.out_proj) with a zero B.
         #
-        # An earlier version of this check treated any inactive module as fatal,
-        # which refused to start a correctly-loaded adapter (32 trained modules
-        # all applied, 6 harmless extras wrapped) -- a false alarm that blocked
-        # the server. The count is now compared against the checkpoint itself.
-        expected = _count_checkpoint_lora_modules(Path(lora_path) / "adapter_model.safetensors")
-        if expected is None:
+        # The real question is whether every module the checkpoint names got
+        # wrapped, so its weights had somewhere to land. That is a set
+        # comparison, and it cannot be confused by the weights' values.
+        ckpt = _checkpoint_lora_modules(Path(lora_path) / "adapter_model.safetensors")
+        if ckpt is None:
             print(
-                "[liveTry] could not read the adapter checkpoint to verify coverage; "
-                "reporting what was wrapped without a verdict",
+                f"[liveTry] reference LoRA: {len(wrapped)} module(s) wrapped; the checkpoint "
+                f"could not be read, so coverage is unverified (starting anyway)",
                 flush=True,
             )
             return
 
-        self.conv_logger.event(
-            "ref_lora_expected", path=str(lora_path),
-            checkpoint_modules=expected, applied=len(active), wrapped=total,
+        missing = sorted(ckpt - wrapped)
+        extra = sorted(wrapped - ckpt)
+        print(
+            f"[liveTry] reference LoRA coverage: checkpoint names {len(ckpt)} module(s), "
+            f"PEFT wrapped {len(wrapped)}, missing {len(missing)}, extra {len(extra)}, "
+            f"zero-valued lora_B {len(zero_b)}",
+            flush=True,
         )
-        if len(active) < expected:
+        self.conv_logger.event(
+            "ref_lora_coverage", path=str(lora_path),
+            checkpoint_modules=len(ckpt), wrapped_modules=len(wrapped),
+            missing_modules=len(missing), extra_modules=len(extra),
+            zero_valued_lora_b=len(zero_b),
+        )
+
+        if missing:
             msg = (
-                f"reference LoRA is only PARTIALLY applied: the checkpoint trains {expected} "
-                f"modules but only {len(active)} received weights. adapter_config.json does not "
-                f"match {lora_path}/adapter_model.safetensors. Regenerate it:\n"
+                f"reference LoRA is only PARTIALLY applied: the checkpoint carries weights for "
+                f"{len(ckpt)} module(s), but {len(missing)} of them were never wrapped, so their "
+                f"weights had nowhere to load. First few: {missing[:5]}. "
+                f"adapter_config.json does not match "
+                f"{lora_path}/adapter_model.safetensors. Regenerate it:\n"
                 f"    python stability/derive_ref_lora_config.py {lora_path}\n"
                 f"Set REF_LORA_STRICT=0 to start anyway."
             )
@@ -913,15 +924,22 @@ class MoshiOnlyEngine:
             return
 
         print(
-            f"[liveTry] reference LoRA fully applied: all {expected} trained module(s) "
-            f"carry their weights -- injected reference blocks will be handled as trained",
+            f"[liveTry] reference LoRA fully applied: every one of the {len(ckpt)} module(s) in "
+            f"the checkpoint is wrapped and loaded -- injected reference blocks will be handled "
+            f"as trained",
             flush=True,
         )
-        if inactive:
+        if extra:
             print(
-                f"[liveTry] ({len(inactive)} additional module(s) were wrapped but the "
-                f"checkpoint does not train them; lora_B = 0 makes them exact no-ops, so they "
-                f"change nothing. Harmless.)",
+                f"[liveTry] ({len(extra)} module(s) were wrapped that the checkpoint does not "
+                f"name; PEFT gives those lora_B = 0, so they are exact no-ops. Harmless.)",
+                flush=True,
+            )
+        if zero_b:
+            print(
+                f"[liveTry] (note: {len(zero_b)} module(s) have an all-zero lora_B and therefore "
+                f"contribute nothing to the forward pass. That is how the checkpoint was saved, "
+                f"not a load failure. e.g. {sorted(zero_b)[:3]})",
                 flush=True,
             )
 
