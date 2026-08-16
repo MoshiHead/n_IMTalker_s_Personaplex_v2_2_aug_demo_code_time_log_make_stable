@@ -200,3 +200,34 @@ assert "--moshi_cfg_coef" not in launcher
 print("[ok] 8. launcher leaves moshi_cfg_coef at 1.0, so case 4 is the real deployment")
 
 print("\nAll gate checks passed.")
+
+
+# --- part C: the launchers must not force the sampling knobs -----------------
+print("\n-- part C: launcher passthrough --")
+
+sw = open("IMTalker/start_winner_live.sh", encoding="utf-8").read()
+rl = open("run_live.sh", encoding="utf-8").read()
+for var in ("PERSONAPLEX_TEMP", "PERSONAPLEX_TEMP_TEXT",
+            "PERSONAPLEX_TOP_K", "PERSONAPLEX_TOP_K_TEXT"):
+    # ${VAR-} passes an empty value through; ${VAR:-0.8} would force one and
+    # defeat "unset means keep the build's own default".
+    assert f'{var}="${{{var}-}}"' in sw, f"start_winner_live.sh forces {var}"
+    assert f'{var}="${{{var}-}}"' in rl, f"run_live.sh forces {var}"
+print("[ok] 1. neither launcher forces a sampling value")
+
+# The seed is the opposite case: it SHOULD default to 42, while still allowing
+# an explicitly empty value to mean "stay random".
+assert 'PERSONAPLEX_SEED="${PERSONAPLEX_SEED-42}"' in sw
+assert 'PERSONAPLEX_SEED="${PERSONAPLEX_SEED-42}"' in rl
+print("[ok] 2. the seed defaults to 42 but an explicit empty value still means random")
+
+import json as _json
+nb = _json.load(open("RunPod_RTX5090_PersonaPlex_IMTalker_Live_fixed.ipynb", encoding="utf-8"))
+params = "".join(nb["cells"][3]["source"])
+for var in ("PERSONAPLEX_TEMP", "PERSONAPLEX_TEMP_TEXT",
+            "PERSONAPLEX_TOP_K", "PERSONAPLEX_TOP_K_TEXT"):
+    assert f'{var} = ""' in params, f"notebook hardcodes {var}"
+assert 'PERSONAPLEX_SEED = "42"' in params
+print("[ok] 3. notebook leaves sampling blank and seeds with 42")
+
+print("\nAll launcher passthrough checks passed.")

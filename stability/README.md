@@ -31,9 +31,15 @@ All are read by `run_live.sh` and set from the notebook's Parameters cell.
 | --- | --- | --- |
 | `PERSONAPLEX_SEED` | `42` | Seeds generation. Empty string = the old random behaviour. |
 | `PERSONAPLEX_RESEED_PER_SESSION` | `1` | Re-seed on every WebSocket connect, so connection *n* matches connection 1. |
-| `PERSONAPLEX_TEMP_TEXT` | `0.7` | Text-stream temperature. **Lower this first** when replies drift off-topic — the text stream carries the meaning. |
-| `PERSONAPLEX_TOP_K_TEXT` | `25` | Text-stream top-k. Try `8` alongside `PERSONAPLEX_TEMP_TEXT=0.4`. |
-| `PERSONAPLEX_TEMP` / `PERSONAPLEX_TOP_K` | `0.8` / `250` | Audio-stream sampling. Mostly affects prosody. |
+| `PERSONAPLEX_TEMP_TEXT` | *(build default)* | Text-stream temperature. **Lower this first** when replies drift off-topic — the text stream carries the meaning. |
+| `PERSONAPLEX_TOP_K_TEXT` | *(build default)* | Text-stream top-k. Try `8` alongside `PERSONAPLEX_TEMP_TEXT=0.4`. |
+| `PERSONAPLEX_TEMP` / `PERSONAPLEX_TOP_K` | *(build default)* | Audio-stream sampling. Mostly affects prosody. |
+
+The four sampling variables are **empty by default on purpose**. An empty value
+passes nothing to `LMGen`, so that build's own defaults survive — PersonaPlex
+forks differ, and baking a number into the launcher would silently change
+generation on a fork whose default is different. The startup line reports which
+values are overrides and which are build defaults.
 | `ALLOW_MOSHI_FALLBACK` | `0` | `0` refuses to start on a degraded runtime. `1` restores the old silent fallbacks. |
 | `ALLOW_WORKSPACE_ASSET_FALLBACK` | `0` | `1` restores the old `/workspace/...`-first asset search. |
 
@@ -128,16 +134,16 @@ weights and the same source.
 ## Verifying the fixes
 
 ```bash
-python stability/test_fixes.py .            # seeding, gates, FM noise, wiring
-python stability/test_runtime_contract.py   # condition tensors + strict gates
+python stability/test_fixes.py .            # seeding, FM noise, wiring
+python stability/test_runtime_contract.py   # condition tensors, gates, launchers
+python stability/test_lmgen_call.py         # LMGen construction across forks
 ```
 
-The first checks that the seed helpers reproduce the sampling stream, that
-`FM.sample` honours `noise_init` per chunk, and that the launcher scripts carry
-the contract. The second replays the startup decision logic against every fork
-shape that turns up in practice — including the bnb4 fork with no
-`moshi.run_inference`, which an earlier version of the gate wrongly rejected.
-Both need only `torch`.
+Together they check that the seed helpers reproduce the sampling stream, that
+`FM.sample` honours `noise_init` per chunk, that the strict gates fire only on
+real losses, and that the `LMGen` call is built from the signature — including
+the bnb4 fork, where `device` is a **required** positional and `cfg_coef` /
+`condition_tensors` / `on_text_hook` do not exist. They need only `torch`.
 
 ## What is still nondeterministic
 

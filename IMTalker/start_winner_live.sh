@@ -263,10 +263,15 @@ export PERSONAPLEX_RESEED_PER_SESSION="${PERSONAPLEX_RESEED_PER_SESSION:-1}"
 # Sampling width. The TEXT stream carries the semantic content, so lower
 # PERSONAPLEX_TEMP_TEXT / PERSONAPLEX_TOP_K_TEXT first if replies drift
 # off-topic; the audio stream's temperature mostly affects prosody.
-export PERSONAPLEX_TEMP="${PERSONAPLEX_TEMP:-0.8}"
-export PERSONAPLEX_TEMP_TEXT="${PERSONAPLEX_TEMP_TEXT:-0.7}"
-export PERSONAPLEX_TOP_K="${PERSONAPLEX_TOP_K:-250}"
-export PERSONAPLEX_TOP_K_TEXT="${PERSONAPLEX_TOP_K_TEXT:-25}"
+#
+# Deliberately EMPTY by default (`-` not `:-`): an empty value passes nothing to
+# LMGen, so whatever that build's own defaults are, they survive. Baking "0.8"
+# in here would silently change generation on any fork whose default differs --
+# the same class of accident these changes exist to remove. Set one to override.
+export PERSONAPLEX_TEMP="${PERSONAPLEX_TEMP-}"
+export PERSONAPLEX_TEMP_TEXT="${PERSONAPLEX_TEMP_TEXT-}"
+export PERSONAPLEX_TOP_K="${PERSONAPLEX_TOP_K-}"
+export PERSONAPLEX_TOP_K_TEXT="${PERSONAPLEX_TOP_K_TEXT-}"
 # 1 = boot degraded (wrong moshi fork, no CFG, no 4-bit) instead of refusing.
 export ALLOW_MOSHI_FALLBACK="${ALLOW_MOSHI_FALLBACK:-0}"
 

@@ -320,7 +320,8 @@ class MoshiOnlyEngine:
 
         import inspect as _inspect
 
-        _lmgen_params = set(_inspect.signature(LMGen.__init__).parameters)
+        _lmgen_sig = _inspect.signature(LMGen.__init__)
+        _lmgen_params = set(_lmgen_sig.parameters)
 
         cond_tensors, cond_status = self._resolve_condition_tensors(
             model_type, float(cfg_coef), "condition_tensors" in _lmgen_params
@@ -335,31 +336,51 @@ class MoshiOnlyEngine:
                 self.sampled_text += piece
 
         # Sampling temperature and top-k decide how much room the seed has to
-        # move in. They were previously left at the LMGen defaults
-        # (temp 0.8 / temp_text 0.7 / top_k 250 / top_k_text 25) with no way to
-        # change them without editing this file. The TEXT stream is the one that
-        # carries semantic content, so PERSONAPLEX_TEMP_TEXT / _TOP_K_TEXT are
-        # the knobs to reach for when replies drift off-topic.
-        sampling_kwargs = {
-            "temp": float(os.environ.get("PERSONAPLEX_TEMP", "0.8")),
-            "temp_text": float(os.environ.get("PERSONAPLEX_TEMP_TEXT", "0.7")),
-            "top_k": int(os.environ.get("PERSONAPLEX_TOP_K", "250")),
-            "top_k_text": int(os.environ.get("PERSONAPLEX_TOP_K_TEXT", "25")),
+        # move in. The TEXT stream carries the semantic content, so
+        # PERSONAPLEX_TEMP_TEXT / _TOP_K_TEXT are the knobs to reach for when
+        # replies drift off-topic.
+        #
+        # An UNSET variable passes nothing, so the build's own default applies.
+        # That matters: hardcoding "0.8" here as the fallback would silently
+        # change generation on any fork whose default differs, which is exactly
+        # the class of accident this whole change set exists to remove. Only an
+        # explicitly-set variable overrides anything.
+        sampling_env = {
+            "temp": ("PERSONAPLEX_TEMP", float),
+            "temp_text": ("PERSONAPLEX_TEMP_TEXT", float),
+            "top_k": ("PERSONAPLEX_TOP_K", int),
+            "top_k_text": ("PERSONAPLEX_TOP_K_TEXT", int),
         }
-        # A sampling knob this build does not expose is benign -- drop it and
-        # say so. That is a different thing from the CORE kwargs below being
-        # missing, which means the wrong fork was imported, and the two must not
-        # be confused: only the second one is fatal.
-        unsupported_sampling = sorted(k for k in sampling_kwargs if k not in _lmgen_params)
-        for k in unsupported_sampling:
-            sampling_kwargs.pop(k)
-        if unsupported_sampling:
+        sampling_kwargs, sampling_effective, ignored_sampling = {}, {}, []
+        for key, (env_name, cast) in sampling_env.items():
+            param = _lmgen_sig.parameters.get(key)
+            build_default = None if param is None else param.default
+            raw = (os.environ.get(env_name) or "").strip()
+            if not raw:
+                sampling_effective[key] = f"{build_default} (build default)"
+                continue
+            if param is None:
+                ignored_sampling.append(f"{env_name}={raw}")
+                sampling_effective[key] = "<not supported by this build>"
+                continue
+            try:
+                sampling_kwargs[key] = cast(raw)
+            except ValueError:
+                print(
+                    f"[liveTry] {env_name}={raw!r} is not a valid {cast.__name__} "
+                    f"-- ignoring it and keeping the build default {build_default!r}",
+                    flush=True,
+                )
+                sampling_effective[key] = f"{build_default} (build default)"
+                continue
+            sampling_effective[key] = f"{sampling_kwargs[key]} (override)"
+        if ignored_sampling:
             print(
-                f"[liveTry] this LMGen build does not expose {unsupported_sampling} "
-                f"-- using its built-in defaults for those",
+                f"[liveTry] this LMGen build exposes no knob for {ignored_sampling} "
+                f"-- those settings have no effect here",
                 flush=True,
             )
-        self._runtime_contract["sampling"] = dict(sampling_kwargs)
+        self._runtime_contract["sampling"] = sampling_effective
 
         # Forks differ in which of these three they expose, and a missing kwarg
         # is only a FAULT when something is actually lost. Judge each on that,
@@ -415,23 +436,40 @@ class MoshiOnlyEngine:
                 raise RuntimeError(msg)
             print(f"[liveTry] DEGRADED: {msg}", flush=True)
 
-        try:
-            self.lm_gen = LMGen(self.lm, **core_kwargs, **sampling_kwargs)
-            self._runtime_contract["lmgen"] = "full" if not core_missing else "partial"
-        except TypeError as e:
-            # Safety net: the signature said these were accepted, so a TypeError
-            # here is something the introspection could not see.
-            msg = (
-                f"LMGen rejected the PersonaPlex kwargs at call time ({e!r}) even though its "
-                f"signature accepts them. moshi loaded from "
-                f"{self._runtime_contract.get('moshi_file', '?')}. Set "
-                f"ALLOW_MOSHI_FALLBACK=1 to run degraded on purpose."
+        # Build the call FROM the signature rather than assuming a shape. Forks
+        # differ in more than which optional kwargs they take: the fork bundled
+        # in the bnb4 snapshot makes `device` a REQUIRED positional, while the
+        # fork this call was originally written against does not take it at all.
+        # Supplying only what the signature asks for is the only version of this
+        # that works across both without a hardcoded fallback.
+        lmgen_kwargs = dict(core_kwargs)
+        lmgen_kwargs.update(sampling_kwargs)
+        if "device" in _lmgen_params:
+            lmgen_kwargs["device"] = self.device
+
+        # The model itself is passed positionally, so exclude self and the first
+        # parameter; anything else left without a default is something this code
+        # does not know how to supply, and guessing would be worse than saying so.
+        _param_names = [n for n in _lmgen_sig.parameters if n != "self"]
+        _model_param = _param_names[0] if _param_names else None
+        required_unmet = [
+            name
+            for name, p in _lmgen_sig.parameters.items()
+            if name not in ("self", _model_param)
+            and p.default is _inspect.Parameter.empty
+            and p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
+            and name not in lmgen_kwargs
+        ]
+        if required_unmet:
+            raise RuntimeError(
+                f"This LMGen build requires {required_unmet}, which this code does not know "
+                f"how to supply. Signature: LMGen{_lmgen_sig}. moshi loaded from "
+                f"{self._runtime_contract.get('moshi_file', '?')}."
             )
-            if self.strict_runtime:
-                raise RuntimeError(msg) from e
-            print(f"[liveTry] DEGRADED: {msg}", flush=True)
-            self.lm_gen = LMGen(self.lm, device=self.device)
-            self._runtime_contract["lmgen"] = "fallback"
+
+        self.lm_gen = LMGen(self.lm, **lmgen_kwargs)
+        self._runtime_contract["lmgen"] = "full" if not core_missing else "partial"
+        self._runtime_contract["lmgen_kwargs"] = sorted(lmgen_kwargs)
 
         # One greppable line recording what this process actually is. The
         # notebook's health check keys off "PersonaPlex runtime contract OK", so
@@ -444,7 +482,8 @@ class MoshiOnlyEngine:
             f"condition_tensors={self._runtime_contract['condition_tensors']}"
             f"({self._runtime_contract.get('condition_source', '?')}) "
             f"seed={self.personaplex_seed} reseed_per_session={self.reseed_per_session} "
-            f"sampling={sampling_kwargs}",
+            f"lmgen_kwargs={self._runtime_contract.get('lmgen_kwargs', [])} "
+            f"sampling={sampling_effective}",
             flush=True,
         )
         # "none-declared" and "unsupported-api" are healthy: the bnb4 PersonaPlex
