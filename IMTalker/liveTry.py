@@ -21,6 +21,7 @@ import base64
 import contextlib
 import json
 import os
+import re
 import sys
 import tarfile
 import time
@@ -43,7 +44,7 @@ FRAME_SIZE = 1920  # 80 ms at 24 kHz, Moshi/Mimi step size
 # code than you think is otherwise indistinguishable from a broken fix -- and
 # was: conversation_logs_5 showed `ref_lora_loaded=False` alongside injected
 # `<ref>` tags, a combination this revision cannot produce.
-PIPELINE_REVISION = "2026-08-16.r7-ref-lora-exact-config"
+PIPELINE_REVISION = "2026-08-16.r8-coverage-verdict"
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +93,44 @@ def seed_personaplex(seed: int | None, where: str) -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     print(f"[liveTry] PersonaPlex sampling seeded: {seed} ({where})", flush=True)
+
+
+_LORA_KEY_RE = re.compile(
+    r"^(?:base_model\.model\.)?(?P<module>.+?)\.lora_(?P<ab>[AB])(?:\.[^.]+)?\.weight$"
+)
+
+
+def _count_checkpoint_lora_modules(safetensors_path: Path) -> int | None:
+    """How many modules the LoRA checkpoint actually trains.
+
+    This is the number to judge a load against: PEFT may wrap extra modules
+    (harmless, since they get lora_B = 0), but it must not MISS any that the
+    checkpoint trained.
+
+    Reads the .safetensors header directly -- 8-byte little-endian length then
+    JSON -- so it needs nothing beyond the standard library and never loads the
+    weights. Returns None if the file cannot be read, so a verification failure
+    never becomes a startup failure.
+    """
+    try:
+        with safetensors_path.open("rb") as f:
+            raw = f.read(8)
+            if len(raw) != 8:
+                return None
+            n = int.from_bytes(raw, "little")
+            if not 0 < n < (256 << 20):
+                return None
+            header = json.loads(f.read(n).decode("utf-8"))
+    except Exception:
+        return None
+
+    header.pop("__metadata__", None)
+    parts: dict[str, set[str]] = {}
+    for key in header:
+        m = _LORA_KEY_RE.match(key)
+        if m:
+            parts.setdefault(m.group("module"), set()).add(m.group("ab"))
+    return sum(1 for sides in parts.values() if {"A", "B"} <= sides)
 
 
 def _ensure_moshi_importable(moshi_root: str | Path) -> None:
@@ -834,29 +873,55 @@ class MoshiOnlyEngine:
             print(f"[liveTry] reference LoRA coverage report failed (ignored): {e!r}", flush=True)
             return
 
-        # A partial load is not a lesser version of this adapter -- it is a
-        # different adapter. The config shipped with the weights used guessed
-        # SUFFIX target_modules, so PEFT wrapped every module whose name ended
-        # in "proj"/"linear"/"fc1"/..., created the extras with lora_B = 0, and
-        # left the real ones unmatched. That was measured at 32/76. Since this
-        # adapter's entire job is to make the model act on injected reference
-        # blocks, a half-applied one produces a server that looks healthy and
-        # silently ignores every retrieved fact.
-        if inactive:
+        # The question that matters is NOT "did PEFT wrap any extra modules" --
+        # it is "did every module the checkpoint trained receive its weights".
+        #
+        # An extra wrapped module is created with lora_B = 0, so B @ A is
+        # exactly zero and it contributes nothing to any forward pass. It costs
+        # a little memory and nothing else. A MISSING module is the real fault:
+        # part of the trained adapter is simply absent, and the adapter cannot
+        # do the job it was trained for.
+        #
+        # An earlier version of this check treated any inactive module as fatal,
+        # which refused to start a correctly-loaded adapter (32 trained modules
+        # all applied, 6 harmless extras wrapped) -- a false alarm that blocked
+        # the server. The count is now compared against the checkpoint itself.
+        expected = _count_checkpoint_lora_modules(Path(lora_path) / "adapter_model.safetensors")
+        if expected is None:
+            print(
+                "[liveTry] could not read the adapter checkpoint to verify coverage; "
+                "reporting what was wrapped without a verdict",
+                flush=True,
+            )
+            return
+
+        self.conv_logger.event(
+            "ref_lora_expected", path=str(lora_path),
+            checkpoint_modules=expected, applied=len(active), wrapped=total,
+        )
+        if len(active) < expected:
             msg = (
-                f"reference LoRA is only partially applied: {len(active)}/{total} modules carry "
-                f"trained weights and {len(inactive)} are zero no-ops. adapter_config.json does "
-                f"not match {lora_path}/adapter_model.safetensors. Regenerate it:\n"
+                f"reference LoRA is only PARTIALLY applied: the checkpoint trains {expected} "
+                f"modules but only {len(active)} received weights. adapter_config.json does not "
+                f"match {lora_path}/adapter_model.safetensors. Regenerate it:\n"
                 f"    python stability/derive_ref_lora_config.py {lora_path}\n"
                 f"Set REF_LORA_STRICT=0 to start anyway."
             )
             if getattr(self, "ref_lora_strict", False):
                 raise RuntimeError(msg)
             print(f"[liveTry] WARNING {msg}", flush=True)
-        else:
+            return
+
+        print(
+            f"[liveTry] reference LoRA fully applied: all {expected} trained module(s) "
+            f"carry their weights -- injected reference blocks will be handled as trained",
+            flush=True,
+        )
+        if inactive:
             print(
-                f"[liveTry] reference LoRA fully applied ({total}/{total} modules) -- "
-                f"injected reference blocks will be handled as trained",
+                f"[liveTry] ({len(inactive)} additional module(s) were wrapped but the "
+                f"checkpoint does not train them; lora_B = 0 makes them exact no-ops, so they "
+                f"change nothing. Harmless.)",
                 flush=True,
             )
 

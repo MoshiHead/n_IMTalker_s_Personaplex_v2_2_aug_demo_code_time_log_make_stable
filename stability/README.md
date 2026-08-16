@@ -46,8 +46,29 @@ exactly those. Startup should then log `reference LoRA fully applied (N/N)`.
 (matching the old 256/128). **If you trained with a different alpha, pass
 `--alpha <value>`** — this is the one value only you know.
 
-`REF_LORA_STRICT=1` (default) refuses to start on a partial load rather than
-serving a half-applied adapter that looks healthy.
+### What the strict check actually asserts
+
+**Every module the checkpoint trains received its weights.** Not "PEFT wrapped
+nothing extra".
+
+An extra wrapped module gets `lora_B = 0`, so `B @ A` is exactly zero — it
+costs a little memory and changes no forward pass. A *missing* module is the
+real fault: part of your adapter is simply absent.
+
+Your regenerated config produced `32/38`: all 32 trained modules applied, plus
+6 harmless extras (`depformer.*.self_attn.out_proj`, which the checkpoint does
+not train). The first version of this check called that fatal and refused to
+start — a false alarm on a correctly-loaded adapter. It now compares the
+applied count against the checkpoint header, so a healthy load starts and a
+genuinely partial one still stops.
+
+Expect at startup:
+
+```
+[liveTry] reference LoRA fully applied: all 32 trained module(s) carry their weights
+[liveTry] (6 additional module(s) were wrapped but the checkpoint does not train them;
+           lora_B = 0 makes them exact no-ops, so they change nothing. Harmless.)
+```
 
 
 ## Wrong answers: what `conversation_logs_1` showed
