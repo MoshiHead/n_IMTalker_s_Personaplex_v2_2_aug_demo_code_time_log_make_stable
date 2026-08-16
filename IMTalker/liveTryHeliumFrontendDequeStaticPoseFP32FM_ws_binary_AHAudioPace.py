@@ -1174,7 +1174,14 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
 
             # --- A search is happening: only now does the model get told to
             # wait. Injection itself must happen on the GPU thread. ---
-            lookup_text = search_helpers.wrap_with_lookup_tags()
+            # Same rule as the <ref> block below: the <lookup> tag is only
+            # meaningful to the adapter trained on it. Without that adapter the
+            # tag is just two more tokens for the model to read aloud, so the
+            # plain sentence is used instead.
+            lookup_text = (
+                search_helpers.wrap_with_lookup_tags()
+                if self.ref_lora_active else "Please wait a minute."
+            )
             self.pending_lookup_tokens = self.tokenizer.encode(lookup_text)
 
             hits: list[dict] = []
@@ -1376,7 +1383,18 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
             if len(ids) > self.max_ref_tokens:
                 ids = ids[: self.max_ref_tokens]
                 ref_content = self.tokenizer.decode(ids)
-            new_ref_tokens = self.tokenizer.encode(search_helpers.wrap_with_ref_tags(ref_content))
+            # <ref> tags only when the adapter that was trained on them is
+            # loaded. With REF_LORA_ENABLED=0 (the default since
+            # conversation_logs_1) the tags are untrained syntax: the model has
+            # no reason to treat them as a reference block, and it demonstrably
+            # reads them out -- "Fees are used on the site. <ref", "coins.>",
+            # "Hmm, the stock market.> Today's gold price is...". Plain text is
+            # strictly better there: the fact enters the model's own text stream
+            # as something it just said, with nothing to mispronounce.
+            new_ref_tokens = self.tokenizer.encode(
+                search_helpers.wrap_with_ref_tags(ref_content)
+                if self.ref_lora_active else ref_content
+            )
             ref_encode_elapsed = time.perf_counter() - t_encode0
             self._turn_timing_stages["ref_encode"] = ref_encode_elapsed
             self.conv_logger.latency.stage(
@@ -3280,6 +3298,9 @@ class LiveHeliumFMOptions(BaseOptions):
         # its training corpus's persona along with the tag syntax. Values below
         # 1.0 keep the <ref> handling while weakening that pull.
         parser.add_argument("--ref_lora_scale", type=float, default=1.0, help="Multiplier on the reference LoRA's strength (1.0 = as trained, 0.3 = much weaker, 0 = no-op)")
+        parser.add_argument("--ref_lora_strict", action="store_true",
+                            help="Refuse to start if the adapter is only partially applied "
+                                 "(adapter_config.json does not match the checkpoint)")
         parser.add_argument("--max_ref_tokens", type=int, default=250, help="Cap on injected <ref> block length, in tokens")
         parser.add_argument(
             "--router_threshold", type=float, default=0.40,
@@ -3519,6 +3540,7 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                 ref_lora_dir=getattr(args, "ref_lora_dir", ""),
                 merge_ref_lora=bool(getattr(args, "merge_ref_lora", False)),
                 ref_lora_scale=float(getattr(args, "ref_lora_scale", 1.0)),
+                ref_lora_strict=bool(getattr(args, "ref_lora_strict", False)),
                 max_ref_tokens=int(getattr(args, "max_ref_tokens", 250)),
                 router_threshold=float(getattr(args, "router_threshold", 0.40)),
                 router_use_rules=bool(int(getattr(args, "router_rules", 1))),

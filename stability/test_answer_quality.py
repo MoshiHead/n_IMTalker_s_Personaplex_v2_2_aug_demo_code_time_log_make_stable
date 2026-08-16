@@ -179,16 +179,21 @@ print("[ok] 7. pre-roll ring and its per-turn reset are wired into the server")
 
 # ============================================== part D: reference LoRA is opt-in
 print("\n-- part D: reference LoRA --")
-assert 'REF_LORA_ENABLED="${REF_LORA_ENABLED:-0}"' in launcher, "ref LoRA must default OFF"
+# CORRECTED. An earlier round defaulted this adapter OFF, on the assumption it
+# was a third-party component whose persona was leaking. It is in fact trained
+# for this deployment, specifically to make the model act on injected reference
+# blocks -- so it belongs ON, and the real defect was that it was being loaded
+# against a mismatched config. See stability/test_ref_lora.py.
+assert 'REF_LORA_ENABLED="${REF_LORA_ENABLED:-1}"' in launcher, \
+    "the adapter must default ON -- it is what makes <ref> injection work"
 assert "--ref_lora_scale" in launcher
 assert '--ref_lora_dir "$REF_LORA_DIR" --ref_lora_scale' in launcher, \
-    "the adapter must only be passed when explicitly enabled"
-# It must not be passed unconditionally any more.
-assert launcher.count("--ref_lora_dir") == 1, "ref_lora_dir must appear only in the opt-in branch"
+    "the adapter must be passed through the REF_LORA_ENABLED branch"
+assert launcher.count("--ref_lora_dir") == 1, "ref_lora_dir must appear in exactly one branch"
 livetry = (REPO / "IMTalker/liveTry.py").read_text(encoding="utf-8")
 assert "_apply_ref_lora_scale" in livetry
 assert "ref_lora_scale" in livetry
-print("[ok] 8. the <lookup>/<ref> adapter is opt-in and scalable")
+print("[ok] 8. the <lookup>/<ref> adapter is enabled, scalable, and coverage-checked")
 
 
 # ================================================ part E: response log bounds
@@ -206,7 +211,7 @@ print("\n-- part F: notebook --")
 nb = json.loads((REPO / "RunPod_RTX5090_PersonaPlex_IMTalker_Live_fixed.ipynb")
                 .read_text(encoding="utf-8"))
 src = "\n".join("".join(c["source"]) for c in nb["cells"])
-for needle in ('REF_LORA_ENABLED = "0"', 'WEB_SEARCH_MIN_SCORE = "0.50"',
+for needle in ('REF_LORA_ENABLED = "1"', 'WEB_SEARCH_MIN_SCORE = "0.50"',
                'env_overrides["REF_LORA_ENABLED"]', 'env_overrides["WEB_SEARCH_MIN_SCORE"]'):
     assert needle in src, f"notebook missing {needle}"
 print("[ok] 10. notebook exposes and forwards the answer-quality controls")

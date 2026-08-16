@@ -1,5 +1,55 @@
 # Stability and answer quality
 
+> **Before anything else, check which code the pod is running.**
+> `grep "PIPELINE REVISION" live_server.log` must print the revision declared
+> in `IMTalker/liveTry.py`. `conversation_logs_5` reported
+> `ref_lora_loaded=False` while still injecting `<ref>` tags — a combination
+> the current revision cannot produce, meaning the deployed server was older
+> than the checkout being edited. The notebook now fails its health check on a
+> revision mismatch.
+
+## The reference LoRA — corrected
+
+An earlier round defaulted `REF_LORA_ENABLED=0` on the assumption that this was
+a third-party adapter leaking someone else's persona. **That was wrong.** It is
+trained for this deployment, specifically so the model acts on injected
+reference blocks. It is back ON by default.
+
+The real defect was that it never loaded as trained:
+
+```
+reference LoRA coverage: 32/76 wrapped modules carry trained weights,
+44 are zero-initialised no-ops
+```
+
+`scripts/download_live_assets.sh` publishes only `adapter_model.safetensors`
+and hand-writes a config with **guessed suffix-style** `target_modules`
+(`"proj"`, `"fc1"`, `"in_proj"`, …). PEFT treats those as suffixes and wraps
+every module in the 7B whose name ends that way — far more than the checkpoint
+trained. The extras get `lora_B = 0` (exact no-ops); the trained modules go
+unmatched. An adapter applied to the wrong module set is not the adapter you
+trained, which is why injected facts were ignored even with it enabled.
+
+```bash
+# derive a config that matches the checkpoint exactly
+python stability/derive_ref_lora_config.py checkpoints/rag_lora/lora
+
+# verify only (the launcher runs this on every start)
+python stability/derive_ref_lora_config.py checkpoints/rag_lora/lora --check
+```
+
+It reads the module paths that actually carry weights and the rank off the
+tensor shapes, then writes `target_modules` as **full paths** so PEFT wraps
+exactly those. Startup should then log `reference LoRA fully applied (N/N)`.
+
+`lora_alpha` cannot be recovered from weights. The tool defaults to `2 × r`
+(matching the old 256/128). **If you trained with a different alpha, pass
+`--alpha <value>`** — this is the one value only you know.
+
+`REF_LORA_STRICT=1` (default) refuses to start on a partial load rather than
+serving a half-applied adapter that looks healthy.
+
+
 ## Wrong answers: what `conversation_logs_1` showed
 
 That session had four separate faults, all now fixed. If replies go wrong
@@ -53,6 +103,38 @@ defaults) against the 33 s hang that was logged.
 **Thread rule, now enforced by a test:** `_route_and_search` runs on a
 background thread and may write **only** the `pending_*` handoff slots. Every
 `search_*` state transition belongs to the GPU thread in `_consume_pending`.
+
+## `conversation_logs_4`: the prompt was the last thing left
+
+Everything upstream was finally clean — `total_dropped_speech_s=0.0`, correct
+transcripts, correct search results, correct compression — and the assistant
+still answered *"What is Bitcoin?"* with:
+
+> *"I'd say it's because they're a small team with a big vision. They've been
+> working on AI stuff for years, they're constantly fine tuning the models…"*
+
+The system prompt is **force-fed as the assistant's own speech**. It ends
+"…promote RB Labs robots when relevant", so the model believed it had just said
+that and simply carried on. `--prompt_settle_sec` was `0`, leaving only 80 ms
+between the prompt and the conversation. And because the KV cache is never
+reset per turn, that monologue ran the entire session — it swallowed the next
+question and both correctly retrieved facts (`$140.72/gram`, `$346.86`).
+
+`conversation_logs_3` looked fine only because its first question was *"What is
+your name?"*, which self-description happens to answer.
+
+| Fix | Detail |
+| --- | --- |
+| `PROMPT_SETTLE_SEC` **0 → 0.96** | the same gap this system already treats as end-of-utterance (`_VAD_SILENCE_FRAMES_REQUIRED`) |
+| settle pads in the **conversational** register | it used sine-on-user — the fork's *priming* marker — so padding kept the model **inside** the prompt. That is why long values used to mute it rather than free it. Silence-on-user is an ordinary gap, so the model reaches a turn boundary |
+| `<ref>` / `<lookup>` tags only when the adapter is loaded | with `REF_LORA_ENABLED=0` the tags are untrained syntax the model reads aloud (*"Hmm, the stock market.>"*, *"coins.>"*, *"<ref"*). Plain text now goes in instead |
+
+**Note on the prompt itself.** Because it arrives as the assistant's own
+speech, every instruction reads as something it already said. "Give financial
+advice" and "promote RB Labs robots" therefore bias it toward volunteering
+advertising and advice instead of answering. That is a wording decision, not a
+bug — but if replies still drift toward self-promotion, shorten
+`IMTalker/prompts/RB_Robert_System_Prompt_full.txt` to identity and tone only.
 
 **Start here if answers are wrong:** `REF_LORA_ENABLED=0` is now the default.
 That single change is what stops the assistant answering finance questions in
@@ -206,6 +288,8 @@ python stability/test_lmgen_call.py         # LMGen construction across forks
 python stability/test_answer_quality.py     # every failure from conversation_logs_1
 python stability/test_injection_and_audio.py # every failure from conversation_logs_2
 python stability/test_search_state.py       # every failure from conversation_logs_3
+python stability/test_prompt_boundary.py    # every failure from conversation_logs_4
+python stability/test_ref_lora.py           # adapter load path + revision marker
 ```
 
 Together they check that the seed helpers reproduce the sampling stream, that

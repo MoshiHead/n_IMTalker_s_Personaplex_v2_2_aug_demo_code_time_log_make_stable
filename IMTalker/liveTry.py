@@ -38,6 +38,13 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 TARGET_SR = 24000
 FRAME_SIZE = 1920  # 80 ms at 24 kHz, Moshi/Mimi step size
 
+# Bump on every behavioural change to this file or the AH server. Printed at
+# startup and recorded in the conversation log, because a pod running older
+# code than you think is otherwise indistinguishable from a broken fix -- and
+# was: conversation_logs_5 showed `ref_lora_loaded=False` alongside injected
+# `<ref>` tags, a combination this revision cannot produce.
+PIPELINE_REVISION = "2026-08-16.r7-ref-lora-exact-config"
+
 
 # ---------------------------------------------------------------------------
 # Reproducibility
@@ -153,6 +160,7 @@ class MoshiOnlyEngine:
         ref_lora_dir: str = "",
         merge_ref_lora: bool = False,
         ref_lora_scale: float = 1.0,
+        ref_lora_strict: bool = True,
         max_ref_tokens: int = 250,
         stt_hf_repo: str = "",
         stt_pkg_dir: str = "",
@@ -325,6 +333,11 @@ class MoshiOnlyEngine:
         # search rather than a local document index.
         self.ref_lora_dir = str(ref_lora_dir or "")
         self.ref_lora_scale = float(ref_lora_scale)
+        self.ref_lora_strict = bool(ref_lora_strict)
+        # True only once the adapter is really applied. `ref_lora_dir` being set
+        # says only that one was REQUESTED -- the startup status line reported
+        # that instead, so a failed or partial load still read as "loaded".
+        self.ref_lora_active = False
         if self.ref_lora_dir:
             self._load_ref_lora(self.ref_lora_dir, merge_lora=bool(merge_ref_lora))
 
@@ -488,6 +501,12 @@ class MoshiOnlyEngine:
         # notebook's health check keys off "PersonaPlex runtime contract OK", so
         # a degraded start can no longer report green.
         print(
+            f"[liveTry] PIPELINE REVISION {PIPELINE_REVISION} "
+            f"(file {Path(__file__).resolve()})",
+            flush=True,
+        )
+        self._runtime_contract["pipeline_revision"] = PIPELINE_REVISION
+        print(
             f"[liveTry] runtime contract: moshi={self._runtime_contract.get('moshi_file', '?')} "
             f"v{self._runtime_contract.get('moshi_version', '?')} "
             f"lmgen={self._runtime_contract['lmgen']} "
@@ -582,7 +601,8 @@ class MoshiOnlyEngine:
         # line (also in the JSONL conversation log as kind=component_status)
         # instead of inferring readiness from scattered print statements.
         self.conv_logger.component_status(
-            ref_lora_loaded=bool(self.ref_lora_dir),
+            ref_lora_loaded=bool(self.ref_lora_active),
+            ref_lora_requested=bool(self.ref_lora_dir),
             stt_loaded=self.stt_lm_gen is not None,
             compressor_loaded=self.context_compressor is not None,
             router_loaded=self.query_router is not None,
@@ -715,11 +735,21 @@ class MoshiOnlyEngine:
                 self.lm = peft_model.merge_and_unload()
             print(f"[liveTry] reference LoRA loaded from {lora_path}", flush=True)
             self._apply_ref_lora_scale(peft_model)
-            self._report_ref_lora_coverage(peft_model, lora_path)
+            # Deliberately OUTSIDE the except below: a coverage failure under
+            # REF_LORA_STRICT must stop startup, not be caught and downgraded to
+            # "continuing without it" like a genuine load error.
+            self.ref_lora_active = True
         except Exception as e:
             tb = traceback.format_exc()
             print(f"[liveTry] reference LoRA load failed (continuing without it): {e!r}\n{tb}", flush=True)
             self.conv_logger.error("ref_lora_load", e, tb)
+            self.ref_lora_active = False
+            self._peft_model = None
+            return
+
+        # Coverage is judged here, outside the try, so REF_LORA_STRICT can stop
+        # the server. A half-applied adapter is the failure that looks healthy.
+        self._report_ref_lora_coverage(peft_model, lora_path)
 
     @torch.no_grad()
     def _apply_ref_lora_scale(self, peft_model) -> None:
@@ -789,9 +819,7 @@ class MoshiOnlyEngine:
                 return
             print(
                 f"[liveTry] reference LoRA coverage: {len(active)}/{total} wrapped modules carry "
-                f"trained weights, {len(inactive)} are zero-initialised no-ops "
-                f"(PEFT wraps everything matching target_modules; the checkpoint does not "
-                f"populate all of them)",
+                f"trained weights, {len(inactive)} are zero-initialised no-ops",
                 flush=True,
             )
             if inactive:
@@ -801,17 +829,36 @@ class MoshiOnlyEngine:
                 "ref_lora_coverage", path=str(lora_path),
                 active_modules=len(active), inactive_modules=len(inactive), total=total,
             )
-            if not active:
-                print(
-                    "[liveTry] WARNING every reference-LoRA module is a zero no-op -- the "
-                    "adapter is having no effect at all. Check that adapter_config.json's "
-                    "target_modules matches the checkpoint (see "
-                    "scripts/download_live_assets.sh, which writes that config by hand).",
-                    flush=True,
-                )
         except Exception as e:
-            # Diagnostics only: never let this break startup.
+            # Measuring must never break startup; the verdict below still runs.
             print(f"[liveTry] reference LoRA coverage report failed (ignored): {e!r}", flush=True)
+            return
+
+        # A partial load is not a lesser version of this adapter -- it is a
+        # different adapter. The config shipped with the weights used guessed
+        # SUFFIX target_modules, so PEFT wrapped every module whose name ended
+        # in "proj"/"linear"/"fc1"/..., created the extras with lora_B = 0, and
+        # left the real ones unmatched. That was measured at 32/76. Since this
+        # adapter's entire job is to make the model act on injected reference
+        # blocks, a half-applied one produces a server that looks healthy and
+        # silently ignores every retrieved fact.
+        if inactive:
+            msg = (
+                f"reference LoRA is only partially applied: {len(active)}/{total} modules carry "
+                f"trained weights and {len(inactive)} are zero no-ops. adapter_config.json does "
+                f"not match {lora_path}/adapter_model.safetensors. Regenerate it:\n"
+                f"    python stability/derive_ref_lora_config.py {lora_path}\n"
+                f"Set REF_LORA_STRICT=0 to start anyway."
+            )
+            if getattr(self, "ref_lora_strict", False):
+                raise RuntimeError(msg)
+            print(f"[liveTry] WARNING {msg}", flush=True)
+        else:
+            print(
+                f"[liveTry] reference LoRA fully applied ({total}/{total} modules) -- "
+                f"injected reference blocks will be handled as trained",
+                flush=True,
+            )
 
     def _load_stt_vad(self, stt_hf_repo: str, stt_pkg_dir: str, device) -> None:
         # Import search_helpers first, on its own, with a specific error
@@ -1065,24 +1112,54 @@ class MoshiOnlyEngine:
         use the model's own zero_text_code, exactly as _step_audio_silence_core
         does, so the context ends with a clear silent gap instead.
 
-        DEFAULT OFF (--prompt_settle_sec 0). Forcing long runs of silence into
-        the model's own text stream conditions it towards staying silent: an
-        unbounded version of exactly this produced a completely mute session.
-        Small values are safe; large ones are not."""
+        conversation_logs_4 is the same failure again, and shows how far it
+        reaches. The prompt ends "...promote RB Labs robots when relevant", so
+        the model -- which believes it just SAID that -- answered "What is
+        Bitcoin?" with "I'd say it's because they're a small team with a big
+        vision. They've been working on AI stuff for years". Because the KV
+        cache is never reset per turn, that monologue then ran the whole
+        session: it swallowed the next question, and it swallowed two correctly
+        retrieved <ref> facts as well. In conversation_logs_3 the same build
+        looked fine only because the first question there was "What is your
+        name?", which self-description happens to answer.
+
+        The user stream carries SILENCE here, not a sine tone. That is the whole
+        point of the step. A sine tone on the user stream is this fork's marker
+        for the priming region (see _inject_tokens in the AH server for the
+        evidence), so padding with sine kept the model INSIDE priming and simply
+        made it quieter -- which is why an unbounded version of this once
+        produced a mute session. Silence on the user stream is an ordinary
+        conversational gap, so the model exits priming and arrives at a turn
+        boundary, waiting for the user.
+
+        Length defaults to the same 0.96s this system already treats as
+        end-of-utterance (_VAD_SILENCE_FRAMES_REQUIRED). Set
+        PROMPT_SETTLE_USER_STREAM=sine to restore the old register for A/B."""
         n = int(round(float(self.prompt_settle_sec) * TARGET_SR / FRAME_SIZE))
         if n <= 0:
+            print(
+                "[liveTry] prompt settle DISABLED (--prompt_settle_sec 0): the model resumes "
+                "immediately after the system prompt, which it heard as its own speech, and may "
+                "carry on describing itself instead of answering the first question",
+                flush=True,
+            )
             return
         zero_text = getattr(self.lm_gen, "zero_text_code", 3)
+        use_sine = os.environ.get("PROMPT_SETTLE_USER_STREAM", "silence").strip().lower() == "sine"
+        user_frame = (
+            self.lm_gen._encode_sine_frame() if use_sine else self.lm_gen._encode_zero_frame()
+        )
         try:
             for _ in range(n):
                 self.lm_gen.step(
                     moshi_tokens=self.lm_gen._encode_zero_frame(),
                     text_token=zero_text,
-                    input_tokens=self.lm_gen._encode_sine_frame(),
+                    input_tokens=user_frame,
                 )
             print(
-                f"[liveTry] settled {n} frames ({self.prompt_settle_sec:.1f}s) of silence after the "
-                f"system prompt so the model does not carry on describing itself",
+                f"[liveTry] prompt settle: {n} frames ({self.prompt_settle_sec:.2f}s) of "
+                f"{'priming' if use_sine else 'conversational'} silence after the system prompt, "
+                f"so the model reaches a turn boundary instead of carrying on describing itself",
                 flush=True,
             )
         except Exception as e:

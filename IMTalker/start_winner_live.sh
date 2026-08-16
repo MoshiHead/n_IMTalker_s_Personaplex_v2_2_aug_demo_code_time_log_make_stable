@@ -120,23 +120,29 @@ if [[ "$ENABLE_SEARCH" == "1" ]]; then
   STT_PKG_DIR="${STT_PKG_DIR:-$PROJECT_ROOT/checkpoints/stt}"
   CONVERSATION_LOG_DIR="${CONVERSATION_LOG_DIR:-$PROJECT_ROOT/conversation_logs}"
   THINKING_SOUND_PATH="${THINKING_SOUND_PATH:-$PROJECT_ROOT/personaplex/ai-thinking-sound.wav}"
-  # The <lookup>/<ref> adapter is now OPT-IN, and off by default.
+  # The <lookup>/<ref> adapter is ON by default: it is what teaches the model to
+  # consume an injected reference block, so without it a retrieved fact is just
+  # text the model happens to have said to itself, and it routinely ignores it.
   #
-  # conversation_logs_1 is the reason. With it loaded, every reply came back in
-  # the voice of a support bot for some app with a virtual currency: "Bitcoin"
-  # was answered with "is a virtual currency used on the platform. You get them
-  # by completing tasks or buying them in the shop", and a correctly retrieved
-  # "<ref> The current Google stock price is $343.94. <ref>" was answered with
-  # "Fees are fee coins. They don't convert to any currency. Fees are used on
-  # the site." The adapter teaches the tag syntax, but it carries its training
-  # corpus's persona with it, at r=128 / alpha=256 (scale 2.0) over the 4-bit
-  # base -- strong enough to override the model's own world knowledge.
+  # It must be loaded AS TRAINED, though. The config shipped alongside the
+  # weights was hand-written with guessed suffix-style target_modules, and PEFT
+  # then wrapped far more modules than the checkpoint contains -- measured at
+  # startup as "coverage: 32/76 wrapped modules carry trained weights, 44 are
+  # zero-initialised no-ops". An adapter loaded against the wrong module set is
+  # not the adapter that was trained, which is the likeliest reason injected
+  # facts were being ignored even with it enabled. Regenerate a matching config
+  # from the checkpoint itself:
   #
-  # Injection works without it: <ref> text is force-fed into the live context
-  # either way. Set REF_LORA_ENABLED=1 to restore it, and REF_LORA_SCALE below
-  # 1.0 to keep its tag handling while weakening its persona.
-  REF_LORA_ENABLED="${REF_LORA_ENABLED:-0}"
+  #     python stability/derive_ref_lora_config.py checkpoints/rag_lora/lora
+  #
+  # REF_LORA_SCALE multiplies its strength (1.0 = as trained). Lower it only if
+  # the adapter's own training vocabulary starts showing up in replies.
+  REF_LORA_ENABLED="${REF_LORA_ENABLED:-1}"
   REF_LORA_SCALE="${REF_LORA_SCALE:-1.0}"
+  # Refuse to start on a partial load rather than serving a half-applied
+  # adapter, which looks like a working system but cannot do the one job the
+  # adapter exists for. Set 0 to downgrade this to a warning.
+  REF_LORA_STRICT="${REF_LORA_STRICT:-1}"
   SEARCH_ARGS=(
     --conversation_log_dir "$CONVERSATION_LOG_DIR"
     --stt_hf_repo "${STT_HF_REPO:-kyutai/stt-1b-en_fr-candle}"
@@ -157,11 +163,23 @@ if [[ "$ENABLE_SEARCH" == "1" ]]; then
     # audio. Muting alone let it compose an invented figure behind the filler
     # and finish that sentence even after the real <ref> arrived.
     --suppress_text_during_search "${SUPPRESS_TEXT_DURING_SEARCH:-1}"
-    # Silence appended after the system prompt. DEFAULT 0: forcing runs of
-    # silence into the model's own text stream biases it towards staying
-    # silent, and it also suppresses the opening greeting. Raise only in small
-    # steps if the model runs on past the prompt.
-    --prompt_settle_sec "${PROMPT_SETTLE_SEC:-0.0}"
+    # Conversational silence appended after the system prompt, so the model
+    # reaches a turn boundary instead of continuing the monologue it thinks it
+    # just delivered.
+    #
+    # The prompt is force-fed as the assistant's OWN SPEECH, so "promote RB Labs
+    # robots when relevant" reads to the model as something it already said. In
+    # conversation_logs_4 that produced "What is Bitcoin?" -> "I'd say it's
+    # because they're a small team with a big vision..." and, because the KV
+    # cache is never reset per turn, the monologue then ran the whole session
+    # and swallowed two correctly retrieved <ref> facts.
+    #
+    # Default 0.96s: the same gap this system already treats as end-of-utterance
+    # (_VAD_SILENCE_FRAMES_REQUIRED = 12 frames). This is now safe to raise
+    # because the padding uses the CONVERSATIONAL register; the old warning
+    # about long values muting the model came from padding in the PRIMING
+    # register, which never let it leave the prompt.
+    --prompt_settle_sec "${PROMPT_SETTLE_SEC:-0.96}"
     # Caps how far behind real time replies can drift. The producer is pinned
     # to real time by frame_q backpressure and can never drain a backlog, so
     # without this any stall becomes a permanent delay for the whole session.
@@ -200,11 +218,25 @@ if [[ "$ENABLE_SEARCH" == "1" ]]; then
   )
   if [[ "$REF_LORA_ENABLED" == "1" ]]; then
     SEARCH_ARGS+=(--ref_lora_dir "$REF_LORA_DIR" --ref_lora_scale "$REF_LORA_SCALE")
-    echo "[warn] REF_LORA_ENABLED=1: the <lookup>/<ref> adapter carries its own persona." >&2
-    echo "       If replies drift to another product's vocabulary, lower REF_LORA_SCALE" >&2
-    echo "       (e.g. 0.3) or set REF_LORA_ENABLED=0." >&2
+    [[ "$REF_LORA_STRICT" == "1" ]] && SEARCH_ARGS+=(--ref_lora_strict)
+    echo "Reference LoRA: enabled scale=$REF_LORA_SCALE strict=$REF_LORA_STRICT dir=$REF_LORA_DIR"
+    # A config that does not match the checkpoint is the failure this guards
+    # against, and it is silent by nature -- the server still starts, the
+    # adapter just does not do its job.
+    if [[ -f "$PROJECT_ROOT/stability/derive_ref_lora_config.py" ]]; then
+      python "$PROJECT_ROOT/stability/derive_ref_lora_config.py" "$REF_LORA_DIR/lora" --check || {
+        echo "[fix] regenerating adapter_config.json from the checkpoint..." >&2
+        python "$PROJECT_ROOT/stability/derive_ref_lora_config.py" "$REF_LORA_DIR/lora" || {
+          echo "Could not derive a matching adapter_config.json. Set REF_LORA_STRICT=0 to" >&2
+          echo "start anyway with a partially-applied adapter, or REF_LORA_ENABLED=0." >&2
+          exit 1
+        }
+      }
+    fi
   else
-    echo "Reference LoRA: disabled (REF_LORA_ENABLED=0). <ref> injection still works."
+    echo "[warn] Reference LoRA DISABLED. Injected <ref> blocks are just text the model" >&2
+    echo "       said to itself, and it will often ignore them. Set REF_LORA_ENABLED=1" >&2
+    echo "       unless you are deliberately testing without the adapter." >&2
   fi
   # Web search is what "needs live data" resolves to, so default it ON
   # whenever a key is available. Without a key the router still runs and
