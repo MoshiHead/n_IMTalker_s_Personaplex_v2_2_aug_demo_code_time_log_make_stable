@@ -8,6 +8,41 @@
 > than the checkout being edited. The notebook now fails its health check on a
 > revision mismatch.
 
+## `conversation_logs_6`: correct text, no voice
+
+The adapter was working — turn 2's reply, *"The current gold price is $140.72
+per gram"*, is your LoRA consuming the injected block exactly as trained. The
+model just never said it out loud. The correlation was perfect:
+
+| turn | injection | heard |
+| --- | --- | --- |
+| Bitcoin | no | **yes** |
+| gold | yes | text only |
+| Tesla | yes | nothing at all |
+| Google | yes | text only |
+| thanks | no | **yes** |
+
+`_inject_tokens` forced `moshi_tokens=_encode_zero_frame()` for every injected
+token. From `prepare_step_input`, `moshi_tokens` writes codebooks **1..8**, and
+the server decodes exactly those as the reply (`mimi.decode(tokens[:, 1:])`).
+So that argument is the assistant's **voice** — and a 20–24 token block wrote
+**1.6–1.9 seconds of digital silence straight into it** while real words went
+into the text stream.
+
+Moshi's audio stream is autoregressive like its text stream. After two seconds
+of forced silence its natural continuation is more silence, so the model kept
+writing and stopped speaking.
+
+The assistant stream is now left free to sample its own audio during injection
+(`moshi_tokens=None` — "not provided", so the depformer fills it as in normal
+speech). Those tokens are still never decoded or sent, so the injection stays
+inaudible; the stream just stays alive instead of two seconds dead.
+`IMTALKER_INJECT_ASSISTANT_STREAM=silence` restores the old behaviour for A/B.
+
+A watchdog now counts text tokens against audio frames for 4s after every
+injection and logs `MUTE AFTER INJECTION` if text appears with no voice — this
+class of failure is otherwise invisible, because the transcript looks perfect.
+
 ## The reference LoRA — corrected
 
 An earlier round defaulted `REF_LORA_ENABLED=0` on the assumption that this was

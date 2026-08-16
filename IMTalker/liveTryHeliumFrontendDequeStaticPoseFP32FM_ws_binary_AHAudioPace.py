@@ -544,6 +544,9 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
     # back as an unrelated sentence. 250 frames = 20s, far longer than any real
     # spoken question.
     _STT_MAX_UTTERANCE_FRAMES = 250
+    # How long to watch the voice after a <ref> injection. 50 frames = 4s, long
+    # enough for the model to begin its grounded answer.
+    _POST_INJECT_WATCH_FRAMES = 50
     # Class-level fallback only -- __init__ always overrides this with an
     # instance attribute derived from the --search_max_filler_sec CLI flag (see
     # __init__ below). Kept here so the attribute still exists with a sane
@@ -689,6 +692,10 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         self._thinking_sound_cursor = 0
         self._thinking_sound_started_at = 0.0
         self._thinking_sound_play_count = 0
+        # Post-injection voice watch (see _consume_pending / _step).
+        self._post_inject_watch = 0
+        self._post_inject_silent = 0
+        self._post_inject_text = 0
 
     def _inject_tokens(self, tokens: list[int]) -> None:
         """Force-feed text tokens via the PUBLIC lm_gen.step() (not the
@@ -717,15 +724,45 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         ordinary conversational state ("the user is not talking"), so the
         injected text lands as context instead.
 
-        IMTALKER_INJECT_USER_STREAM=sine restores the old behaviour for A/B.
+        The ASSISTANT's own audio stream is left free to generate, rather than
+        being forced to silence. This is what decides whether the model can
+        still speak afterwards.
+
+        Moshi's audio stream is autoregressive just like its text stream. The
+        old code forced SILENCE_TOKENS into it for every injected token -- 20 to
+        24 frames, i.e. 1.6-1.9 SECONDS of digital silence -- while feeding real
+        words into the text stream. That teaches the model, in context, to write
+        without speaking, and its natural continuation is more of the same.
+        conversation_logs_6 is the clean experiment: on the two turns with no
+        injection the reply was heard normally, and on all three turns with an
+        injection the text came out correct and the audio never did --
+
+            "The current gold price is $140.72 per gram."   (logged, not heard)
+            "Good day."                                     (logged, not heard)
+            turn 3: no spoken response at all in 20.9s
+
+        Letting the model sample its own audio tokens keeps the two streams
+        coupled, so generation continues in a speaking state. Those tokens are
+        never decoded or sent -- the injection stays inaudible either way -- but
+        they leave the audio stream alive instead of two seconds dead.
+
+        IMTALKER_INJECT_USER_STREAM=sine and IMTALKER_INJECT_ASSISTANT_STREAM=
+        silence each restore the corresponding old behaviour, for A/B.
         """
         use_sine = os.environ.get("IMTALKER_INJECT_USER_STREAM", "silence").strip().lower() == "sine"
         user_frame = (
             self.lm_gen._encode_sine_frame() if use_sine else self.lm_gen._encode_zero_frame()
         )
+        force_assistant_silence = (
+            os.environ.get("IMTALKER_INJECT_ASSISTANT_STREAM", "generate").strip().lower()
+            == "silence"
+        )
+        # None = "not provided" in prepare_step_input, so the depformer samples
+        # the assistant's audio tokens as it would during normal speech.
+        assistant_frame = self.lm_gen._encode_zero_frame() if force_assistant_silence else None
         for tok in tokens:
             self.lm_gen.step(
-                moshi_tokens=self.lm_gen._encode_zero_frame(),
+                moshi_tokens=assistant_frame,
                 text_token=tok,
                 input_tokens=user_frame,
             )
@@ -1600,6 +1637,13 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
             self._stop_thinking_sound(self.search_turn_epoch, "ref_ready", "the answer was ready")
             t0 = time.perf_counter()
             self._inject_tokens(ref_tokens)
+            # Watch the voice for a few seconds after the injection. A grounded
+            # turn that produces text but no audio is the exact failure
+            # conversation_logs_6 showed, and it is invisible in the logs
+            # otherwise -- the transcript looks perfect. Counted in _step.
+            self._post_inject_watch = self._POST_INJECT_WATCH_FRAMES
+            self._post_inject_silent = 0
+            self._post_inject_text = 0
             # The grounded answer starts HERE, not where the user began speaking.
             # PersonaPlex is full-duplex and murmurs a guess while the question
             # is still being asked -- conversation_logs_3 logged "Hmm, the stock
@@ -1823,6 +1867,43 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         # replace it below: after the swap, `reply_pcm` may be the filler clip,
         # whose level says nothing about whether the model is speaking.
         model_own_rms = float(np.sqrt(np.mean(np.square(reply_pcm, dtype=np.float32))))
+
+        # -- Post-injection voice watch --------------------------------------
+        # Text without voice after a grounded injection is a silent failure:
+        # the conversation log reads perfectly while the user hears nothing.
+        # This turns it into one explicit line naming both counts.
+        if self._post_inject_watch > 0:
+            self._post_inject_watch -= 1
+            if model_own_rms <= self._SPEECH_RMS_THRESHOLD:
+                self._post_inject_silent += 1
+            if token_piece:
+                self._post_inject_text += 1
+            if self._post_inject_watch == 0:
+                spoke = self._POST_INJECT_WATCH_FRAMES - self._post_inject_silent
+                if spoke == 0 and self._post_inject_text > 0:
+                    print(
+                        f"[liveTryPlasticity][search] MUTE AFTER INJECTION: the model emitted "
+                        f"{self._post_inject_text} text token(s) but no audio above "
+                        f"{self._SPEECH_RMS_THRESHOLD} in the "
+                        f"{self._POST_INJECT_WATCH_FRAMES * MIMI_FRAME_SIZE / TARGET_SR:.1f}s "
+                        f"after the <ref>. The reply exists in the transcript and the user heard "
+                        f"nothing. Try IMTALKER_INJECT_ASSISTANT_STREAM=silence to A/B the "
+                        f"injection's audio-stream handling.",
+                        flush=True,
+                    )
+                    self.conv_logger.event(
+                        "mute_after_injection",
+                        f"text={self._post_inject_text} audio_frames=0",
+                        text_tokens=self._post_inject_text,
+                        audio_frames=0,
+                        watched_frames=self._POST_INJECT_WATCH_FRAMES,
+                    )
+                else:
+                    self.conv_logger.event(
+                        "voice_after_injection",
+                        f"audio_frames={spoke} text={self._post_inject_text}",
+                        audio_frames=spoke, text_tokens=self._post_inject_text,
+                    )
 
         # First real audio of this turn -> the honest end-to-end latency.
         was_awaiting_first_speech = self._turn_awaiting_first_speech
