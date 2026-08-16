@@ -115,6 +115,12 @@ _ECHOED_TAG_RE = re.compile(r"<\s*/?\s*(?:ref|lookup|system)\s*>", re.IGNORECASE
 _PARTIAL_TAG_RE = re.compile(r"<\s*/?\s*(?:r(?:e(?:f)?)?|l(?:o(?:o(?:k(?:u(?:p)?)?)?)?)?|s(?:y(?:s(?:t(?:e(?:m)?)?)?)?)?)\s*$", re.IGNORECASE)
 _ORPHAN_TAG_TAIL_RE = re.compile(r"^[\s.>]*>")
 _ORPHAN_TAG_END_RE = re.compile(r">\s*$")
+# A ">" left mid-reply where a tag's closing bracket survived the turn boundary:
+# conversation_logs_3 has "Hmm, the stock market.> Today's gold price is $140.72
+# per gram." Anchored to a sentence end so ordinary comparisons ("a > b", "x >=
+# 3") are untouched -- those have a space or a digit before the bracket, not
+# a full stop.
+_ORPHAN_TAG_MID_RE = re.compile(r"(?<=[.!?])\s*>\s*")
 
 # A compressor sentence that ASSERTS the absence of an answer. Injecting one of
 # these as grounding tells the model, in the voice of a retrieved fact, that no
@@ -152,6 +158,7 @@ def strip_injected_tags(text: str) -> str:
     cleaned = _PARTIAL_TAG_RE.sub("", cleaned)
     cleaned = _ORPHAN_TAG_TAIL_RE.sub("", cleaned)
     cleaned = _ORPHAN_TAG_END_RE.sub("", cleaned)
+    cleaned = _ORPHAN_TAG_MID_RE.sub(" ", cleaned)
     return re.sub(r"\s{2,}", " ", cleaned).strip()
 
 

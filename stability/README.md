@@ -31,6 +31,29 @@ The transcript-window fix from the first round is confirmed working:
 `stt_frames_decoded` fell from **147–437 frames (12–35 s)** to **23–56 frames
 (1.8–4.5 s)**.
 
+## `conversation_logs_3`: the injection fix landed, one regression found
+
+Grounded answers came out correct for the first time — *"Today's gold price is
+$140.72 per gram"*, *"Tesla's stock is valued at $341.64 per share"* — and the
+un-searched turns were clean too (*"Bitcoin is a digital currency that runs on
+blockchain. It's decentralized…"*). One fault remained, introduced by the
+previous round.
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| thinking sound looped **33 s** and never stopped, after tavily returned 0 results | the previous round cleared `search_awaiting_ref` **on the background thread** — the very flag that makes the GPU thread run `_consume_pending`. So the cancel path, which stops the clip and releases the text hold, was never reached | the background thread writes only `pending_search_cancelled`; the GPU thread owns every state transition |
+| the next session answered *"What is Bitcoin?"* with *"big planes are huge for transporting lots of people"* | the looping clip echoed into the mic and was transcribed as *"It's Dolph. It's Dolph. It's Dolph…"* — that echo primed the fresh session's context, and it took two turns to wash out | fixed upstream by the hang; a watchdog now guarantees no clip outlives its search |
+| *"Hmm, the stock market.> Today's gold price is…"* | a `>` left mid-reply where a tag's bracket survived the turn boundary, plus the model's full-duplex murmur while the question was still being asked | mid-string `.>` stripping; the logged reply now starts at the injection |
+
+The watchdog is deliberately independent: it keys **only** on the clip being
+active and sits at the top level of `_step`, so it fires on every 80 ms chunk
+regardless of which flag is stuck. Budget is the filler cap + 2 s (8 s at
+defaults) against the 33 s hang that was logged.
+
+**Thread rule, now enforced by a test:** `_route_and_search` runs on a
+background thread and may write **only** the `pending_*` handoff slots. Every
+`search_*` state transition belongs to the GPU thread in `_consume_pending`.
+
 **Start here if answers are wrong:** `REF_LORA_ENABLED=0` is now the default.
 That single change is what stops the assistant answering finance questions in
 the vocabulary of an app store. Injection still works without the adapter — a
@@ -182,6 +205,7 @@ python stability/test_runtime_contract.py   # condition tensors, gates, launcher
 python stability/test_lmgen_call.py         # LMGen construction across forks
 python stability/test_answer_quality.py     # every failure from conversation_logs_1
 python stability/test_injection_and_audio.py # every failure from conversation_logs_2
+python stability/test_search_state.py       # every failure from conversation_logs_3
 ```
 
 Together they check that the seed helpers reproduce the sampling stream, that

@@ -1347,8 +1347,19 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
                 # the same session ("You can buy Bitcoin directly on exchanges
                 # or through a broker...") were good. An empty context beats a
                 # discouraging one.
-                self.search_awaiting_ref = False
-                self.search_ref_committed_this_turn = True
+                #
+                # ONLY the handoff slot is written here. This runs on the
+                # BACKGROUND thread, and `search_awaiting_ref` is what makes the
+                # GPU thread call _consume_pending at all -- clearing it from
+                # here (as an earlier version of this block did) meant the GPU
+                # thread never ran the cancel path, so the thinking sound never
+                # stopped and the text hold was never released.
+                # conversation_logs_3 caught it exactly: tavily returned 0
+                # results at 04:20:29, no thinking_sound_stop was ever written,
+                # and the clip looped for 33s until the user gave up. The loop
+                # then echoed back into the microphone and was transcribed as
+                # "Hello, it's Dolph. It's Dolph. It's Dolph..." -- which is
+                # also what poisoned the next session's opening context.
                 self.pending_search_cancelled = True
                 self.conv_logger.latency.count(my_epoch, injected_anything=False)
                 print(
@@ -1571,6 +1582,13 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
             self._stop_thinking_sound(self.search_turn_epoch, "ref_ready", "the answer was ready")
             t0 = time.perf_counter()
             self._inject_tokens(ref_tokens)
+            # The grounded answer starts HERE, not where the user began speaking.
+            # PersonaPlex is full-duplex and murmurs a guess while the question
+            # is still being asked -- conversation_logs_3 logged "Hmm, the stock
+            # market.> Today's gold price is $140.72 per gram." Everything before
+            # the facts arrived was the model thinking out loud, not its answer,
+            # so the reply is recorded from the injection onward.
+            self._turn_start_audio_text_len = len(self.audio_text)
             elapsed = time.perf_counter() - t0
             self._turn_timing_stages["ref_inject"] = elapsed
             self.conv_logger.latency.stage(
@@ -1694,6 +1712,43 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
                 self.search_awaiting_ref = False
                 self.search_thinking_active = False
                 self.suppress_text_until_ref = False
+
+        # -- Thinking-sound watchdog -----------------------------------------
+        # Independent of every flag above, because the failure it guards against
+        # is precisely one of those flags being left in the wrong state. In
+        # conversation_logs_3 a background-thread bug cleared search_awaiting_ref
+        # before the GPU thread could run the cancel path, so _consume_pending
+        # was never called again: the clip looped for 33 seconds, echoed into
+        # the microphone, was transcribed as "It's Dolph. It's Dolph...", and
+        # poisoned the next session's opening context.
+        #
+        # A filler clip must never outlive the search it covers. This is the one
+        # place that is guaranteed to run on every 80ms chunk.
+        if self.search_thinking_active:
+            playing_s = time.perf_counter() - self._thinking_sound_started_at
+            budget_s = (self._SEARCH_MAX_FILLER_FRAMES * MIMI_FRAME_SIZE / TARGET_SR) + 2.0
+            if playing_s > budget_s:
+                print(
+                    f"[liveTryPlasticity][search] WATCHDOG: thinking sound has played for "
+                    f"{playing_s:.1f}s (budget {budget_s:.1f}s) -- forcing it off and releasing "
+                    f"the model. Something left the search state stuck; see the log above.",
+                    flush=True,
+                )
+                self.conv_logger.error(
+                    "thinking_sound_watchdog",
+                    RuntimeError(f"filler ran {playing_s:.1f}s past its budget"),
+                    "",
+                )
+                self._stop_thinking_sound(
+                    self.search_turn_epoch, "watchdog",
+                    "it had been playing far too long, so it was stopped automatically",
+                )
+                self.suppress_text_until_ref = False
+                self.search_awaiting_ref = False
+                self.search_ref_committed_this_turn = True
+                self.pending_lookup_tokens = None
+                self.pending_ref_tokens = None
+                self.pending_start_thinking = False
 
         # While a search is in flight, hand the model its own "say nothing"
         # token instead of letting it sample text. process_transformer_output
