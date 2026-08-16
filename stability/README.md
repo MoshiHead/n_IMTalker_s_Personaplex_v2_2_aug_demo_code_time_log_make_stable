@@ -14,6 +14,23 @@ again, this table is the triage order.
 | every reply logged missing its first words | the reply slice started 960 ms **after** the user stopped, but the model starts at +0.03 s | boundary moved to the user's first word |
 | `<ref` and `coins.>` spoken aloud | tag stripping only matched complete tags | partial-tag + orphan-`>` patterns |
 
+## `conversation_logs_2`: what the first round fixed, and what it exposed
+
+Disabling the adapter worked — the unsearched turns became genuinely good
+("You can buy Bitcoin directly on exchanges or through a broker…", "Bitcoin is
+code, not a physical thing. It lives on a blockchain…"). Two faults were left
+standing underneath it, both now fixed.
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| **Every** `<ref>` injection produced a greeting instead of an answer — *"Okay, the S and P.> Thank you for calling RB Labs. Have a great day!"*, 4 turns out of 4 | the injection fed a **sine tone on the user stream**, which in this fork appears in exactly three places, all of them system-prompt priming. The model read the injection as "a new system prompt just ended" and did what it always does then: greet | user stream now carries **silence**; `IMTALKER_INJECT_USER_STREAM=sine` restores the old behaviour for A/B |
+| *"What is Bitcoin?"* → *"A beat is a measure of timing"*; turn 1 → *"Hmm, I can't hear you well."* | **4.5 s of microphone audio discarded mid-question**. The backlog sits permanently near the 2.0 s cap (`frame_q_depth=32`, the backpressure limit), so the trim kept slicing into speech | trim now removes **silence only**, and cuts speech solely past a hard ceiling of 2.5× the cap |
+| 3 of 4 searches injected *"There's no specific information available on this…"* | the fallback ref asserts, as a retrieved fact, that no facts exist | nothing is injected; the model answers from its own knowledge |
+
+The transcript-window fix from the first round is confirmed working:
+`stt_frames_decoded` fell from **147–437 frames (12–35 s)** to **23–56 frames
+(1.8–4.5 s)**.
+
 **Start here if answers are wrong:** `REF_LORA_ENABLED=0` is now the default.
 That single change is what stops the assistant answering finance questions in
 the vocabulary of an app store. Injection still works without the adapter — a
@@ -164,6 +181,7 @@ python stability/test_fixes.py .            # seeding, FM noise, wiring
 python stability/test_runtime_contract.py   # condition tensors, gates, launchers
 python stability/test_lmgen_call.py         # LMGen construction across forks
 python stability/test_answer_quality.py     # every failure from conversation_logs_1
+python stability/test_injection_and_audio.py # every failure from conversation_logs_2
 ```
 
 Together they check that the seed helpers reproduce the sampling stream, that

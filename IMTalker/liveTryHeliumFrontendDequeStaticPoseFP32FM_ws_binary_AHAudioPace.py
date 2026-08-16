@@ -692,15 +692,42 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
 
     def _inject_tokens(self, tokens: list[int]) -> None:
         """Force-feed text tokens via the PUBLIC lm_gen.step() (not the
-        hidden-capturing `_step` installed above) -- ports server.py's
-        <ref>/<lookup> mid-stream injection technique unchanged.
-        reset_streaming() is never called: the shared KV-cache (and the
-        conversation heard so far) stays intact across the injection."""
+        hidden-capturing `_step` installed above). reset_streaming() is never
+        called: the shared KV-cache (and the conversation heard so far) stays
+        intact across the injection.
+
+        The USER stream carries silence, not a sine tone. This is the whole
+        difference between an injection the model reads as context and one it
+        reads as a new system prompt.
+
+        In this fork a sine tone on the user stream appears in exactly three
+        places -- _step_voice_prompt_frame, _step_audio_silence_core and
+        _step_text_prompt_core -- all of them system-prompt priming, and lm.py
+        states the convention outright: "(agent text, user audio, agent audio) :
+        (PADs, silence, sine)". Injecting with sine therefore replayed the
+        priming signature mid-conversation, and the model answered it the way it
+        answers the end of a system prompt: by greeting the user.
+        conversation_logs_2 caught this on 4 of 4 search turns --
+
+            "Okay, the S and P.>  Thank you for calling RB Labs. Have a great day!"
+            "Well the gold market.>  Hi, this is RB Labs. How can I help you today?"
+
+        -- the model's real answer cut off at the tag, then a fresh greeting,
+        with the retrieved fact ignored. Silence on the user stream is an
+        ordinary conversational state ("the user is not talking"), so the
+        injected text lands as context instead.
+
+        IMTALKER_INJECT_USER_STREAM=sine restores the old behaviour for A/B.
+        """
+        use_sine = os.environ.get("IMTALKER_INJECT_USER_STREAM", "silence").strip().lower() == "sine"
+        user_frame = (
+            self.lm_gen._encode_sine_frame() if use_sine else self.lm_gen._encode_zero_frame()
+        )
         for tok in tokens:
             self.lm_gen.step(
                 moshi_tokens=self.lm_gen._encode_zero_frame(),
                 text_token=tok,
-                input_tokens=self.lm_gen._encode_sine_frame(),
+                input_tokens=user_frame,
             )
 
     def _stt_step(self, chunk: torch.Tensor) -> None:
@@ -1308,9 +1335,30 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
             if my_epoch != self.search_turn_epoch or self.search_ref_committed_this_turn:
                 return
 
-            ref_content = grounding.strip() if grounding else (
-                "There's no specific information available on this, so answer from general knowledge."
-            )
+            if not grounding or not grounding.strip():
+                # Nothing usable was retrieved. Inject NOTHING and release the
+                # text hold, so the model answers from its own knowledge.
+                #
+                # This used to inject "There's no specific information available
+                # on this, so answer from general knowledge." -- a sentence
+                # asserting, in the voice of a retrieved fact, that no facts
+                # exist. conversation_logs_2 fired it on 3 of 4 search turns and
+                # the replies were worse for it, while the unsearched turns in
+                # the same session ("You can buy Bitcoin directly on exchanges
+                # or through a broker...") were good. An empty context beats a
+                # discouraging one.
+                self.search_awaiting_ref = False
+                self.search_ref_committed_this_turn = True
+                self.pending_search_cancelled = True
+                self.conv_logger.latency.count(my_epoch, injected_anything=False)
+                print(
+                    "[liveTryPlasticity][search] nothing usable retrieved -- injecting nothing "
+                    "and letting the model answer from its own knowledge",
+                    flush=True,
+                )
+                return
+
+            ref_content = grounding.strip()
             t_encode0 = time.perf_counter()
             ids_before_trim = self.tokenizer.encode(ref_content)
             ids = ids_before_trim
@@ -1354,11 +1402,12 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
             self.conv_logger.narrate_no_information(my_epoch)
             self.conv_logger.latency.mark(my_epoch, "grounding_ready", f"failed: {e!r}")
             if my_epoch == self.search_turn_epoch:
-                fallback_tokens = self.tokenizer.encode(search_helpers.wrap_with_ref_tags(
-                    "There's no specific information available on this, so answer from general knowledge."
-                ))
-                self._pending_ref_token_counts = (len(fallback_tokens), self.max_ref_tokens)
-                self.pending_ref_tokens = fallback_tokens
+                # The search machinery broke. Release the model with an empty
+                # context rather than force-feeding a sentence that says no
+                # information exists -- same reasoning as the two paths above:
+                # an injection is a context event the model reacts to, so an
+                # unhelpful one is worse than none.
+                self.pending_search_cancelled = True
 
     def _open_turn_latency(self, turn_id: int, transcript: str) -> None:
         """Open this turn's record in latency_<session>.log and seed it with
@@ -1549,43 +1598,43 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
                 flush=True,
             )
         elif self.search_filler_frame_count >= self._SEARCH_MAX_FILLER_FRAMES:
-            fallback_text = "There's no specific information available on this, so answer from general knowledge."
-            fallback = self.tokenizer.encode(search_helpers.wrap_with_ref_tags(fallback_text))
+            # The search did not finish in time. Release the model and inject
+            # NOTHING.
+            #
+            # This used to force-feed "There's no specific information available
+            # on this, so answer from general knowledge." Two things were wrong
+            # with that. It asserts, as a retrieved fact, that no facts exist --
+            # which pushes the model toward a non-answer. And every injection
+            # costs a burst of forced steps that the model reads as a context
+            # boundary. Releasing the text hold with an empty context lets it
+            # answer from its own knowledge, which conversation_logs_2 shows it
+            # does well when left alone.
             self.search_awaiting_ref = False
             self.search_ref_committed_this_turn = True
             self.suppress_text_until_ref = False
             self._stop_thinking_sound(
                 self.search_turn_epoch, "filler_timeout",
-                "the search was taking too long, so the assistant moved on with what it had",
-            )
-            t0 = time.perf_counter()
-            self._inject_tokens(fallback)
-            fallback_inject_elapsed = time.perf_counter() - t0
-            self._turn_timing_stages["ref_inject"] = fallback_inject_elapsed
-            self.conv_logger.latency.stage(
-                self._latency_turn_id, "ref_inject", fallback_inject_elapsed,
-                note=f"{len(fallback)} token(s), generic fallback after filler timeout",
+                "the search was taking too long, so the assistant answered from what it knows",
             )
             self.conv_logger.latency.mark(
-                self._latency_turn_id, "ref_injected",
+                self._latency_turn_id, "search_released",
                 f"filler timeout after {self.search_filler_frame_count} chunk(s) -- "
-                f"the search did not finish in time",
+                f"nothing injected, answering from the model's own knowledge",
             )
             self.conv_logger.latency.count(
                 self._latency_turn_id, search_timed_out=True,
-                grounding_tokens_injected=len(fallback),
-            )
-            self.conv_logger.ref_injected(fallback_text, len(fallback), fallback_inject_elapsed, kind="ref_fallback")
-            self.conv_logger.narrate_injection(
-                self.search_turn_epoch, fallback_text, len(fallback), len(fallback),
-                self.max_ref_tokens, kind="ref_fallback",
+                grounding_tokens_injected=0, injected_anything=False,
             )
             self.conv_logger.turn_done(
                 self.search_turn_epoch, "search timed out, answered from own knowledge",
                 time.perf_counter() - (self._turn_timing_start or time.perf_counter()),
             )
             self._log_timing_summary()
-            print("[liveTryPlasticity][search] <ref> fallback injected after filler timeout", flush=True)
+            print(
+                "[liveTryPlasticity][search] filler timeout -- nothing injected, "
+                "the model answers from its own knowledge",
+                flush=True,
+            )
 
     @torch.no_grad()
     def _step(self, pcm24: np.ndarray) -> dict:

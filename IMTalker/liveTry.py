@@ -124,6 +124,14 @@ def _make_placeholder_jpeg(path: str | Path | None) -> str:
 
 
 class MoshiOnlyEngine:
+    # RMS below which a 20ms window of microphone audio counts as a gap between
+    # words rather than speech. Trimming those costs latency and nothing else.
+    # Well under the 0.02 the server's own [MIC] logging calls "VOICE".
+    _INPUT_SILENCE_RMS = 0.005
+    # Multiple of max_input_buffer_sec at which unbounded delay becomes the
+    # worse failure and speech may be cut after all.
+    _INPUT_HARD_CEILING_FACTOR = 2.5
+
     def __init__(
         self,
         *,
@@ -214,6 +222,9 @@ class MoshiOnlyEngine:
         # any audio can arrive so the very first append is already bounded.
         self.max_input_buffer_sec = float(max_input_buffer_sec)
         self._input_dropped_samples = 0
+        # Tracked separately because they mean very different things: dropping
+        # silence is free, dropping speech is a question the model never heard.
+        self._input_dropped_speech_samples = 0
         self._input_drop_last_log = 0.0
         # Read by _settle_after_prompt() / _start_thinking_sound(). These MUST be
         # set before _warmup_runtime() below, which calls reset_session() ->
@@ -1160,29 +1171,77 @@ class MoshiOnlyEngine:
         # conversation needs: being 30s behind is far worse than missing the
         # first moments of a sentence. Every drop is logged, because silently
         # discarding user speech would be its own bug.
+        # -- Drop from SILENCE, never from the middle of a word ---------------
+        # The trim above the cap used to slice the oldest samples unconditionally.
+        # Because the GPU producer is pinned to real time by frame_q
+        # backpressure, the backlog sits permanently near the cap (measured at
+        # 1.24-1.44s in conversation_logs_2 with a 2.0s cap), so those slices
+        # landed inside whatever the user happened to be saying. That session
+        # discarded 4.5s of speech, most of it in the first minute, and the
+        # damage is visible in the replies: the model answered "What is
+        # Bitcoin?" with "A beat is a measure of timing" -- it never heard the
+        # whole word -- and on the very first turn said outright "Hmm, I can't
+        # hear you well. Can you speak up or move closer?"
+        #
+        # Trimming a silent gap costs nothing: it removes latency without
+        # removing information. So look for silence in the oldest audio first,
+        # and only cut into speech once the buffer passes a hard ceiling, where
+        # unbounded delay is the worse failure.
         max_samples = int(float(getattr(self, "max_input_buffer_sec", 0.0)) * TARGET_SR)
         if max_samples > 0 and self.input_buffer.shape[0] > max_samples:
-            dropped = int(self.input_buffer.shape[0] - max_samples)
+            want = int(self.input_buffer.shape[0] - max_samples)
+            excess = self.input_buffer[:want]
+            # Scan the oldest `want` samples in 20ms steps and keep only the
+            # leading run that is quiet enough to be a gap between words.
+            step = max(1, TARGET_SR // 50)
+            quiet = 0
+            while quiet + step <= excess.shape[0]:
+                window = excess[quiet:quiet + step]
+                if float(np.sqrt(np.mean(np.square(window, dtype=np.float32)))) > self._INPUT_SILENCE_RMS:
+                    break
+                quiet += step
+            hard_ceiling = int(
+                float(getattr(self, "max_input_buffer_sec", 0.0))
+                * self._INPUT_HARD_CEILING_FACTOR * TARGET_SR
+            )
+            if quiet >= want:
+                dropped = want                      # the whole excess was silence
+            elif self.input_buffer.shape[0] > hard_ceiling:
+                dropped = want                      # too far behind; latency now wins
+            elif quiet > 0:
+                dropped = quiet                     # trim only the silent lead-in
+            else:
+                return                              # all speech, still under the ceiling: keep it
             self.input_buffer = self.input_buffer[dropped:].copy()
             self._input_dropped_samples += dropped
+            self._input_dropped_speech_samples += max(0, dropped - quiet)
             now = time.perf_counter()
             if now - self._input_drop_last_log >= 2.0:
                 self._input_drop_last_log = now
                 total_s = self._input_dropped_samples / TARGET_SR
+                speech_s = self._input_dropped_speech_samples / TARGET_SR
+                kind = "silence" if dropped == quiet else "SPEECH"
                 print(
-                    f"[liveTry] microphone backlog exceeded "
-                    f"{max_samples / TARGET_SR:.2f}s -- dropped {dropped / TARGET_SR:.2f}s of the "
-                    f"oldest audio to stop the reply delay growing ({total_s:.1f}s dropped this "
-                    f"session). The GPU cannot keep up with real time; lower the render cost "
-                    f"(--render_sub_batch / --jpeg_quality / --nfe) or raise "
-                    f"--max_input_buffer_sec to trade latency for completeness.",
+                    f"[liveTry] microphone backlog exceeded {max_samples / TARGET_SR:.2f}s -- "
+                    f"trimmed {dropped / TARGET_SR:.2f}s of {kind} "
+                    f"(session total {total_s:.1f}s, of which {speech_s:.1f}s was speech). "
+                    + (
+                        "Trimming silence is free. "
+                        if speech_s <= 0.0 else
+                        "SPEECH WAS DISCARDED: the model did not hear all of the question. "
+                        "Lower the render cost (--render_sub_batch / --jpeg_quality / --nfe) "
+                        "or raise --max_input_buffer_sec. "
+                    ),
                     flush=True,
                 )
                 self.conv_logger.event(
                     "input_backlog_drop",
-                    f"dropped={dropped / TARGET_SR:.2f}s total={total_s:.1f}s",
+                    f"dropped={dropped / TARGET_SR:.2f}s of {kind} total={total_s:.1f}s "
+                    f"speech={speech_s:.1f}s",
                     dropped_s=round(dropped / TARGET_SR, 3),
+                    dropped_kind=kind,
                     total_dropped_s=round(total_s, 2),
+                    total_dropped_speech_s=round(speech_s, 2),
                     cap_s=round(max_samples / TARGET_SR, 2),
                 )
 
