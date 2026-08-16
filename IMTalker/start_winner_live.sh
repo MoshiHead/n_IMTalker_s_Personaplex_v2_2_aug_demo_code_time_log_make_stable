@@ -120,9 +120,25 @@ if [[ "$ENABLE_SEARCH" == "1" ]]; then
   STT_PKG_DIR="${STT_PKG_DIR:-$PROJECT_ROOT/checkpoints/stt}"
   CONVERSATION_LOG_DIR="${CONVERSATION_LOG_DIR:-$PROJECT_ROOT/conversation_logs}"
   THINKING_SOUND_PATH="${THINKING_SOUND_PATH:-$PROJECT_ROOT/personaplex/ai-thinking-sound.wav}"
+  # The <lookup>/<ref> adapter is now OPT-IN, and off by default.
+  #
+  # conversation_logs_1 is the reason. With it loaded, every reply came back in
+  # the voice of a support bot for some app with a virtual currency: "Bitcoin"
+  # was answered with "is a virtual currency used on the platform. You get them
+  # by completing tasks or buying them in the shop", and a correctly retrieved
+  # "<ref> The current Google stock price is $343.94. <ref>" was answered with
+  # "Fees are fee coins. They don't convert to any currency. Fees are used on
+  # the site." The adapter teaches the tag syntax, but it carries its training
+  # corpus's persona with it, at r=128 / alpha=256 (scale 2.0) over the 4-bit
+  # base -- strong enough to override the model's own world knowledge.
+  #
+  # Injection works without it: <ref> text is force-fed into the live context
+  # either way. Set REF_LORA_ENABLED=1 to restore it, and REF_LORA_SCALE below
+  # 1.0 to keep its tag handling while weakening its persona.
+  REF_LORA_ENABLED="${REF_LORA_ENABLED:-0}"
+  REF_LORA_SCALE="${REF_LORA_SCALE:-1.0}"
   SEARCH_ARGS=(
     --conversation_log_dir "$CONVERSATION_LOG_DIR"
-    --ref_lora_dir "$REF_LORA_DIR"
     --stt_hf_repo "${STT_HF_REPO:-kyutai/stt-1b-en_fr-candle}"
     --stt_pkg_dir "$STT_PKG_DIR"
     --vad_threshold "${VAD_THRESHOLD:-0.5}"
@@ -175,8 +191,21 @@ if [[ "$ENABLE_SEARCH" == "1" ]]; then
     # as 0.04 for clearly-unrelated pages were still used). Search engines
     # always return something, so this floor is the only thing between an
     # unrelated page and the assistant's spoken answer.
-    --web_search_min_score "${WEB_SEARCH_MIN_SCORE:-0.15}"
+    #
+    # Raised 0.15 -> 0.50 from conversation_logs_1, which separates cleanly at
+    # that line: the one genuinely useful search scored 0.82/0.81/0.71, while
+    # every unusable one scored 0.26, 0.24, 0.19 and 0.18. At 0.15 those junk
+    # pages were summarised and injected as fact.
+    --web_search_min_score "${WEB_SEARCH_MIN_SCORE:-0.50}"
   )
+  if [[ "$REF_LORA_ENABLED" == "1" ]]; then
+    SEARCH_ARGS+=(--ref_lora_dir "$REF_LORA_DIR" --ref_lora_scale "$REF_LORA_SCALE")
+    echo "[warn] REF_LORA_ENABLED=1: the <lookup>/<ref> adapter carries its own persona." >&2
+    echo "       If replies drift to another product's vocabulary, lower REF_LORA_SCALE" >&2
+    echo "       (e.g. 0.3) or set REF_LORA_ENABLED=0." >&2
+  else
+    echo "Reference LoRA: disabled (REF_LORA_ENABLED=0). <ref> injection still works."
+  fi
   # Web search is what "needs live data" resolves to, so default it ON
   # whenever a key is available. Without a key the router still runs and
   # still decides -- turns that need live data just fall back to the model's
@@ -224,10 +253,10 @@ for required in \
   [[ -e "$required" ]] || { echo "Missing required path: $required" >&2; exit 1; }
 done
 
-if [[ "$ENABLE_SEARCH" == "1" ]]; then
+if [[ "$ENABLE_SEARCH" == "1" && "${REF_LORA_ENABLED:-0}" == "1" ]]; then
   for required in \
     "$REF_LORA_DIR/lora/adapter_config.json"; do
-    [[ -e "$required" ]] || { echo "Missing required search path: $required (re-run scripts/download_live_assets.sh, or set ENABLE_SEARCH=0)" >&2; exit 1; }
+    [[ -e "$required" ]] || { echo "Missing required search path: $required (re-run scripts/download_live_assets.sh, or set REF_LORA_ENABLED=0)" >&2; exit 1; }
   done
 fi
 

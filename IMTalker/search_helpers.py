@@ -107,7 +107,40 @@ def decode_stt_tokens_with_ids(
 # echoed tag; that is a model/adapter behavior, not something the transcript
 # layer can reach.
 _ECHOED_TAG_RE = re.compile(r"<\s*/?\s*(?:ref|lookup|system)\s*>", re.IGNORECASE)
+# A turn boundary can also land INSIDE a tag, leaving "<ref" with no closing
+# bracket at the end of a reply -- conversation_logs_1 turn 12 ends with a bare
+# "<ref", and turn 13's whole logged reply was "coins.>". The complete-tag
+# pattern above cannot match either. These two cover the broken halves: an
+# unterminated tag anywhere, and a stray ">" left at the start or end.
+_PARTIAL_TAG_RE = re.compile(r"<\s*/?\s*(?:r(?:e(?:f)?)?|l(?:o(?:o(?:k(?:u(?:p)?)?)?)?)?|s(?:y(?:s(?:t(?:e(?:m)?)?)?)?)?)\s*$", re.IGNORECASE)
 _ORPHAN_TAG_TAIL_RE = re.compile(r"^[\s.>]*>")
+_ORPHAN_TAG_END_RE = re.compile(r">\s*$")
+
+# A compressor sentence that ASSERTS the absence of an answer. Injecting one of
+# these as grounding tells the model, in the voice of a retrieved fact, that no
+# information exists -- strictly worse than injecting nothing and letting it
+# answer from its own knowledge.
+_NON_ANSWER_RE = re.compile(
+    r"\b(?:"
+    r"(?:has|have|was|were|is|are)\s+not\s+(?:been\s+)?(?:provided|specified|mentioned|given|listed|found|available|disclosed)"
+    r"|no\s+(?:specific\s+)?(?:information|data|details|answer|price|value|figure|results?)\s+(?:is|are|was|were)?\s*"
+    r"(?:available|provided|given|found|mentioned)?"
+    r"|not\s+(?:available|provided|specified|mentioned|found|disclosed)"
+    r"|does\s+not\s+(?:provide|specify|mention|contain|include)"
+    r"|do\s+not\s+(?:provide|specify|mention|contain|include)"
+    r"|cannot\s+be\s+determined"
+    r"|unable\s+to\s+(?:find|determine|provide)"
+    r"|unclear\s+from\s+the\s+(?:passages?|text|context)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Evidence that a sentence carries a real retrieved value: a number, a currency
+# amount, a percentage, a date or a proper noun the question did not supply.
+_HAS_CONCRETE_VALUE_RE = re.compile(
+    r"(?:[$£€¥]\s?\d|(?<![A-Za-z])\d[\d,]*(?:\.\d+)?\s*(?:%|percent|USD|EUR|GBP|dollars?|euros?|pounds?)?)",
+    re.IGNORECASE,
+)
 
 
 def strip_injected_tags(text: str) -> str:
@@ -116,7 +149,9 @@ def strip_injected_tags(text: str) -> str:
     if not text:
         return ""
     cleaned = _ECHOED_TAG_RE.sub(" ", text)
+    cleaned = _PARTIAL_TAG_RE.sub("", cleaned)
     cleaned = _ORPHAN_TAG_TAIL_RE.sub("", cleaned)
+    cleaned = _ORPHAN_TAG_END_RE.sub("", cleaned)
     return re.sub(r"\s{2,}", " ", cleaned).strip()
 
 
@@ -1212,6 +1247,41 @@ class ContextCompressor:
             print(f"[search_helpers][compressor] rejected (NO_CONTEXT/empty): {result!r}", flush=True)
             self.last_stats["compressor_rejected"] = "no_context_or_empty"
             return ""
+
+        # Reject a non-answer stated as a fact. conversation_logs_1 turn 11
+        # injected "Today's guest list on the market has not been provided."
+        # as grounding -- the model was handed a sentence asserting that no
+        # information exists, which is worse than handing it nothing at all.
+        if _NON_ANSWER_RE.search(result):
+            print(
+                f"[search_helpers][compressor] rejected (states that nothing was found): {result!r}",
+                flush=True,
+            )
+            self.last_stats["compressor_rejected"] = "non_answer"
+            return ""
+
+        # Reject an answer that is just the question read back. Turn 10 searched
+        # a garbled transcript ("The heart is good as gold, market. Rise.") and
+        # the compressor returned "The heart is good as gold, market." -- which
+        # passed the passage-overlap gate below because those words also appear
+        # on gold pages, and was then injected as a fact.
+        q_words = {w.lower().strip(".,!?'\"") for w in (question or "").split()}
+        q_words.discard("")
+        a_words = {w.lower().strip(".,!?'\"") for w in result.split()}
+        a_words.discard("")
+        if a_words and q_words:
+            echo = len(a_words & q_words) / len(a_words)
+            self.last_stats["compressor_question_echo"] = round(echo, 3)
+            # A real answer adds a number, name or date the question did not
+            # contain. Requiring only 30% new content is deliberately lenient.
+            if echo >= 0.70 and not _HAS_CONCRETE_VALUE_RE.search(result):
+                print(
+                    f"[search_helpers][compressor] rejected (echoes the question, "
+                    f"echo={echo:.2f}, no concrete value): {result!r}",
+                    flush=True,
+                )
+                self.last_stats["compressor_rejected"] = f"question_echo={echo:.2f}"
+                return ""
 
         passage_words = set(w.lower() for c in chunks[: self.max_passages] for w in c["text"].split())
         answer_words = set(w.lower().strip(".,!?") for w in result.split())

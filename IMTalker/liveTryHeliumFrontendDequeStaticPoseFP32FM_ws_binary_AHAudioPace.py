@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import collections
 import concurrent.futures
 import contextlib
 import json
@@ -533,6 +534,16 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
     # -- Turn-detection constants (frame = one MIMI_FRAME_SIZE / 80ms chunk,
     # same granularity as _step() itself) --
     _VAD_SILENCE_FRAMES_REQUIRED = 12   # ~960ms of silence ends an utterance
+    # Frames of audio kept before the first detected word, so the leading
+    # consonant is not clipped (the STT emits a token a frame or two after the
+    # audio that produced it). 8 frames = 640ms.
+    _STT_PREROLL_FRAMES = 8
+    # Hard ceiling on one transcript window. Without it the buffer grew for the
+    # whole gap since the previous turn: conversation_logs_1 decoded 437 frames
+    # (35 seconds) as a single utterance, which is how a clean question came
+    # back as an unrelated sentence. 250 frames = 20s, far longer than any real
+    # spoken question.
+    _STT_MAX_UTTERANCE_FRAMES = 250
     # Class-level fallback only -- __init__ always overrides this with an
     # instance attribute derived from the --search_max_filler_sec CLI flag (see
     # __init__ below). Kept here so the attribute still exists with a sane
@@ -574,6 +585,13 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         # Per-conversation STT/turn-detection state. No-ops harmlessly when
         # STT isn't configured (self.stt_lm_gen stays None).
         self.stt_token_buffer: list = []
+        # Frames seen while nobody is speaking. Bounded and discarded as they
+        # age out, so silence and the assistant's own leaked audio can never
+        # accumulate into the next transcript (see _stt_step).
+        self._stt_preroll: collections.deque = collections.deque(
+            maxlen=self._STT_PREROLL_FRAMES
+        )
+        self._stt_overlong_logged = False
         self.stt_in_utterance = False
         self.stt_silence_frame_count = 0
         self.stt_last_vad_end = False
@@ -698,9 +716,11 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         if vad_heads and len(vad_heads) > 2:
             vad_score = float(vad_heads[2][0, 0, 0].cpu().item())
         if stt_tokens is not None:
-            self.stt_token_buffer.append(stt_tokens[:, :1, :].cpu())
+            frame = stt_tokens[:, :1, :].cpu()
             text_token = stt_tokens[0, 0, 0].item()
-            if text_token not in (0, self.stt_padding_token_id):
+            is_speech_token = text_token not in (0, self.stt_padding_token_id)
+
+            if is_speech_token:
                 if not self.stt_in_utterance:
                     # First real word of a new user utterance: everything the
                     # model emitted before this point belongs to the PREVIOUS
@@ -712,8 +732,47 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
                     # previous turn's answer. Frozen here because
                     # _last_text_emit_perf keeps moving afterwards.
                     self._answer_end_perf = self._last_text_emit_perf
+                    # Open the transcript window with the pre-roll, so the
+                    # leading consonant of the first word is not clipped -- the
+                    # STT emits a token a frame or two after the audio that
+                    # produced it.
+                    self.stt_token_buffer = list(self._stt_preroll)
+                    self._stt_preroll.clear()
                 self.stt_in_utterance = True
                 self.stt_last_vad_end = False
+
+            # -- Bound the transcript window ---------------------------------
+            # This buffer used to accumulate EVERY frame from the moment the
+            # last turn ended, so the decode covered the whole gap since the
+            # previous question -- including the assistant's entire reply
+            # leaking back through the microphone. conversation_logs_1 measured
+            # stt_frames_decoded between 147 and 437 frames, i.e. 11.8s to 35.0s
+            # of audio decoded as one "utterance", and turn 2's 437 frames match
+            # the 35s gap since turn 1 exactly. That is what produced transcripts
+            # like "Always the inventor of Big Ben" for "who is the inventor of
+            # bitcoin" -- the words were real, they just came from all over a
+            # half-minute window.
+            #
+            # Now: while nobody is speaking, frames go into a small pre-roll
+            # ring and are discarded as they age out. Only once a real word
+            # arrives does the window open, and it is capped so a stuck VAD
+            # cannot grow it without limit.
+            if self.stt_in_utterance:
+                self.stt_token_buffer.append(frame)
+                if len(self.stt_token_buffer) > self._STT_MAX_UTTERANCE_FRAMES:
+                    dropped = len(self.stt_token_buffer) - self._STT_MAX_UTTERANCE_FRAMES
+                    self.stt_token_buffer = self.stt_token_buffer[dropped:]
+                    if not self._stt_overlong_logged:
+                        self._stt_overlong_logged = True
+                        print(
+                            f"[liveTryPlasticity][STT] utterance exceeded "
+                            f"{self._STT_MAX_UTTERANCE_FRAMES * 0.08:.1f}s -- keeping only the most "
+                            f"recent audio. If this repeats, the VAD is not detecting end of "
+                            f"speech (check STT_VAD_THRESHOLD and microphone echo).",
+                            flush=True,
+                        )
+            else:
+                self._stt_preroll.append(frame)
         if vad_score > self.vad_threshold:
             self.stt_silence_frame_count += 1
         else:
@@ -738,6 +797,8 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
             )
             stt_decode_elapsed = time.perf_counter() - t_stt0
             self.stt_token_buffer = []
+            self._stt_preroll.clear()
+            self._stt_overlong_logged = False
             self.stt_in_utterance = False
             self.stt_silence_frame_count = 0
             if transcript.strip():
@@ -856,7 +917,25 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         bookkeeping and (optionally) the acknowledgement sound."""
         self.search_turn_epoch += 1
         self.search_current_transcript = transcript
-        self._turn_start_audio_text_len = len(self.audio_text)
+        # Where THIS turn's answer begins in audio_text.
+        #
+        # This used to be len(audio_text) at the moment the VAD fired -- i.e.
+        # ~960ms after the user actually stopped talking. PersonaPlex is
+        # full-duplex and starts answering while the question is still being
+        # asked (conversation_logs_1 logs "first word 0.03s after the question"
+        # on every single turn), so its opening words landed BEFORE this
+        # snapshot and were sliced off every logged reply: "a robot at RB Labs"
+        # instead of "I'm a robot at RB Labs", "is a virtual currency" instead
+        # of "Bitcoin is a virtual currency".
+        #
+        # _utterance_start_audio_text_len marks where the user's first word
+        # arrived, which is the true start of this exchange. Falling back to
+        # len(audio_text) keeps the old behaviour if the STT never set it.
+        self._turn_start_audio_text_len = (
+            self._utterance_start_audio_text_len
+            if self._utterance_start_audio_text_len
+            else len(self.audio_text)
+        )
         self._turn_awaiting_first_speech = True
         self._turn_first_speech_epoch = self.search_turn_epoch
         print(
@@ -949,7 +1028,25 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         self.pending_lookup_tokens = None
         self.pending_ref_tokens = None
         self.pending_search_cancelled = False
-        self._turn_start_audio_text_len = len(self.audio_text)
+        # Where THIS turn's answer begins in audio_text.
+        #
+        # This used to be len(audio_text) at the moment the VAD fired -- i.e.
+        # ~960ms after the user actually stopped talking. PersonaPlex is
+        # full-duplex and starts answering while the question is still being
+        # asked (conversation_logs_1 logs "first word 0.03s after the question"
+        # on every single turn), so its opening words landed BEFORE this
+        # snapshot and were sliced off every logged reply: "a robot at RB Labs"
+        # instead of "I'm a robot at RB Labs", "is a virtual currency" instead
+        # of "Bitcoin is a virtual currency".
+        #
+        # _utterance_start_audio_text_len marks where the user's first word
+        # arrived, which is the true start of this exchange. Falling back to
+        # len(audio_text) keeps the old behaviour if the STT never set it.
+        self._turn_start_audio_text_len = (
+            self._utterance_start_audio_text_len
+            if self._utterance_start_audio_text_len
+            else len(self.audio_text)
+        )
         self._turn_awaiting_first_speech = True
         self._turn_first_speech_epoch = my_epoch
 
@@ -3075,6 +3172,10 @@ class LiveHeliumFMOptions(BaseOptions):
         # below reproduces the plain conversational behavior of this script)
         parser.add_argument("--ref_lora_dir", default="", help="Dir containing lora/ with the <lookup>/<ref> LoRA adapter")
         parser.add_argument("--merge_ref_lora", action="store_true", help="Merge the reference LoRA into base weights instead of keeping it unmerged (QLoRA-style; default is unmerged)")
+        # The adapter ships r=128 / alpha=256 (effective scale 2.0) and brings
+        # its training corpus's persona along with the tag syntax. Values below
+        # 1.0 keep the <ref> handling while weakening that pull.
+        parser.add_argument("--ref_lora_scale", type=float, default=1.0, help="Multiplier on the reference LoRA's strength (1.0 = as trained, 0.3 = much weaker, 0 = no-op)")
         parser.add_argument("--max_ref_tokens", type=int, default=250, help="Cap on injected <ref> block length, in tokens")
         parser.add_argument(
             "--router_threshold", type=float, default=0.40,
@@ -3313,6 +3414,7 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                 text_prompt=getattr(args, "text_prompt", ""),
                 ref_lora_dir=getattr(args, "ref_lora_dir", ""),
                 merge_ref_lora=bool(getattr(args, "merge_ref_lora", False)),
+                ref_lora_scale=float(getattr(args, "ref_lora_scale", 1.0)),
                 max_ref_tokens=int(getattr(args, "max_ref_tokens", 250)),
                 router_threshold=float(getattr(args, "router_threshold", 0.40)),
                 router_use_rules=bool(int(getattr(args, "router_rules", 1))),

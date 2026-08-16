@@ -144,6 +144,7 @@ class MoshiOnlyEngine:
         # --- STT + query routing + web search (all optional, off by default) ---
         ref_lora_dir: str = "",
         merge_ref_lora: bool = False,
+        ref_lora_scale: float = 1.0,
         max_ref_tokens: int = 250,
         stt_hf_repo: str = "",
         stt_pkg_dir: str = "",
@@ -312,6 +313,7 @@ class MoshiOnlyEngine:
         # came from, so it is still required now that the text comes from a web
         # search rather than a local document index.
         self.ref_lora_dir = str(ref_lora_dir or "")
+        self.ref_lora_scale = float(ref_lora_scale)
         if self.ref_lora_dir:
             self._load_ref_lora(self.ref_lora_dir, merge_lora=bool(merge_ref_lora))
 
@@ -701,11 +703,46 @@ class MoshiOnlyEngine:
             if merge_lora:
                 self.lm = peft_model.merge_and_unload()
             print(f"[liveTry] reference LoRA loaded from {lora_path}", flush=True)
+            self._apply_ref_lora_scale(peft_model)
             self._report_ref_lora_coverage(peft_model, lora_path)
         except Exception as e:
             tb = traceback.format_exc()
             print(f"[liveTry] reference LoRA load failed (continuing without it): {e!r}\n{tb}", flush=True)
             self.conv_logger.error("ref_lora_load", e, tb)
+
+    @torch.no_grad()
+    def _apply_ref_lora_scale(self, peft_model) -> None:
+        """Dial the reference LoRA's strength up or down.
+
+        The adapter ships r=128 / alpha=256, i.e. an effective scaling of 2.0
+        over the 4-bit base. That is strong enough to bring its training
+        corpus's persona along with the <lookup>/<ref> syntax it was meant to
+        teach -- conversation_logs_1 shows the assistant answering "What is
+        Bitcoin?" as though it were support for an app with a virtual currency.
+        Scaling below 1.0 keeps the tag handling while weakening that pull;
+        REF_LORA_SCALE=0 makes it a no-op without changing the load path.
+        """
+        scale = float(getattr(self, "ref_lora_scale", 1.0))
+        if abs(scale - 1.0) < 1e-9:
+            return
+        try:
+            touched = 0
+            for module in peft_model.modules():
+                scaling = getattr(module, "scaling", None)
+                if isinstance(scaling, dict) and scaling:
+                    for adapter_name in list(scaling):
+                        scaling[adapter_name] = scaling[adapter_name] * scale
+                        touched += 1
+            print(
+                f"[liveTry] reference LoRA scaled by {scale} across {touched} adapter "
+                f"layer(s) -- lower values keep the <ref> syntax while weakening the "
+                f"adapter's own persona",
+                flush=True,
+            )
+            self.conv_logger.event("ref_lora_scaled", scale=scale, layers=touched)
+        except Exception as e:
+            print(f"[liveTry] reference LoRA scaling failed (running at full strength): {e!r}",
+                  flush=True)
 
     @torch.no_grad()
     def _report_ref_lora_coverage(self, peft_model, lora_path) -> None:

@@ -1,3 +1,29 @@
+# Stability and answer quality
+
+## Wrong answers: what `conversation_logs_1` showed
+
+That session had four separate faults, all now fixed. If replies go wrong
+again, this table is the triage order.
+
+| Symptom in the log | Cause | Control |
+| --- | --- | --- |
+| "What is Bitcoin?" → *"is a virtual currency used on the platform… buying them in the shop"* | the `<lookup>/<ref>` adapter brought its training corpus's persona with it (r=128 / alpha=256 = scale 2.0 over the 4-bit base) | `REF_LORA_ENABLED=0` (new default), `REF_LORA_SCALE` |
+| "who is the inventor of bitcoin" → *"Always the inventor of Big Ben"* | the STT decoded **11.8–35 s** per "utterance" (`stt_frames_decoded` 147–437), spanning the whole gap since the last turn | pre-roll ring + utterance gating + cap |
+| a junk page summarised and injected as fact | relevance floor was `0.15`; the useful search scored 0.82, the useless ones 0.18–0.26 | `WEB_SEARCH_MIN_SCORE=0.50` |
+| *"Today's guest list on the market has not been provided."* injected as grounding | the compressor's non-answers and question echoes were injected verbatim | new rejection gates |
+| every reply logged missing its first words | the reply slice started 960 ms **after** the user stopped, but the model starts at +0.03 s | boundary moved to the user's first word |
+| `<ref` and `coins.>` spoken aloud | tag stripping only matched complete tags | partial-tag + orphan-`>` patterns |
+
+**Start here if answers are wrong:** `REF_LORA_ENABLED=0` is now the default.
+That single change is what stops the assistant answering finance questions in
+the vocabulary of an app store. Injection still works without the adapter — a
+`<ref>` block is force-fed into the live context either way.
+
+```bash
+# restore it, weakened, if you want its tag handling back
+REF_LORA_ENABLED=1 REF_LORA_SCALE=0.3 bash run_live.sh
+```
+
 # Run-to-run stability
 
 This directory exists because the same pod, the same notebook and the same
@@ -137,6 +163,7 @@ weights and the same source.
 python stability/test_fixes.py .            # seeding, FM noise, wiring
 python stability/test_runtime_contract.py   # condition tensors, gates, launchers
 python stability/test_lmgen_call.py         # LMGen construction across forks
+python stability/test_answer_quality.py     # every failure from conversation_logs_1
 ```
 
 Together they check that the seed helpers reproduce the sampling stream, that
