@@ -113,16 +113,23 @@ route_src = ast.get_source_segment(server_src, route)
 #     SAID "Please wait a minute The current Tesla stock is $309.32."
 # Once the assistant's audio stream was freed (r10) the model voices whatever
 # it is fed, so feeding it a sentence makes it say that sentence.
+# CORRECTED. Turning this off, on the strength of the logs_7 echo, made the
+# next session strictly worse: three consecutive search turns produced no words
+# at all. Those 8 real tokens were the only thing interrupting a ~4.2s run of
+# forced zero_text_code, and without them the text stream was conditioned into
+# silence exactly as the audio stream had been. The echo was a cosmetic
+# complaint; the silence was a broken feature. See stability/test_forced_runs.py.
 assert "LOOKUP_INJECT_ENABLED" in route_src, "the filler injection must be switchable"
-m = re.search(r'LOOKUP_INJECT_ENABLED",\s*"0"', route_src)
-assert m, "the filler must default OFF"
+m = re.search(r'LOOKUP_INJECT_ENABLED",\s*"1"', route_src)
+assert m, "the filler must default ON -- it breaks the forced-text run"
 assert "self.pending_lookup_tokens = None" in route_src, \
-    "with the filler off, nothing may be queued for injection"
-print("[ok] 8. the <lookup> filler is off by default and no longer spoken back")
+    "the disabled branch must queue nothing"
+print("[ok] 8. the <lookup> filler is on, breaking the forced-text run during a search")
 
-# The wait is still covered: thinking sound + text suppression.
+# The wait is covered by the thinking sound; the text hold is now bounded.
 assert "_start_thinking_sound" in server_src and "suppress_text_until_ref" in server_src
-print("[ok] 9. the wait is still covered by the thinking sound and the text hold")
+assert "_SUPPRESS_TEXT_MAX_FRAMES" in server_src, "the text hold must be bounded"
+print("[ok] 9. the wait is covered by the thinking sound, with a bounded text hold")
 
 
 # =================== part E: tell 'never spoke' from 'never delivered' (logs_7)

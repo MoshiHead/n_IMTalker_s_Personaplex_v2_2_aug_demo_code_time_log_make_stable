@@ -215,6 +215,13 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         # 6.0s: comfortably above the worst observed combined latency of
         # ~3.7s, including margin for GPU-contention slowdown).
         self._SEARCH_MAX_FILLER_FRAMES = max(1, round(float(search_max_filler_sec) * TARGET_SR / MIMI_FRAME_SIZE))
+        # Bound on the text hold. 0 disables the bound and restores the old
+        # "hold for the whole search" behaviour, which is what silenced three
+        # consecutive search turns.
+        _hold_sec = float(os.environ.get("SUPPRESS_TEXT_MAX_SEC", "1.2") or 0.0)
+        self._SUPPRESS_TEXT_MAX_FRAMES = (
+            max(1, round(_hold_sec * TARGET_SR / MIMI_FRAME_SIZE)) if _hold_sec > 0 else 0
+        )
 
         # "Thinking sound": played in place of the model's own audio ONLY while
         # an online search is actually running (see _start_thinking_sound and
@@ -547,6 +554,11 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
     # How long to watch the voice after a <ref> injection. 50 frames = 4s, long
     # enough for the model to begin its grounded answer.
     _POST_INJECT_WATCH_FRAMES = 50
+    # Longest run of forced zero_text_code allowed while a search is in flight.
+    # 15 frames = 1.2s: long enough to stop the model committing to an invented
+    # figure in the first moment, short enough not to condition the text stream
+    # into silence. Overridden from SUPPRESS_TEXT_MAX_SEC in __init__.
+    _SUPPRESS_TEXT_MAX_FRAMES = 15
     # Class-level fallback only -- __init__ always overrides this with an
     # instance attribute derived from the --search_max_filler_sec CLI flag (see
     # __init__ below). Kept here so the attribute still exists with a sane
@@ -661,6 +673,8 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         # "$1,408.50", and its first audio came 0.03s after the question,
         # about five seconds BEFORE the reference existed.
         self.suppress_text_until_ref = False
+        # Consecutive frames of forced zero_text_code (see _step's bound).
+        self._suppress_text_frames = 0
         self._pending_ref_token_counts = (0, 0)
         self.search_filler_frame_count = 0
         self.search_session_history: list[tuple[str, str]] = []
@@ -1216,22 +1230,21 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
 
             # --- A search is happening: only now does the model get told to
             # wait. Injection itself must happen on the GPU thread. ---
-            # The <lookup> filler is OFF by default, because the model reads it
-            # out loud.
+            # The <lookup> filler is ON, and turning it off was a mistake worth
+            # recording.
             #
-            # conversation_logs_7 caught this directly: turn 6's entire spoken
-            # reply was "Please wait a minute." and turn 7's was "Please wait a
-            # minute The current Tesla stock is $309.32." -- the filler text
-            # coming back as speech instead of acting as a stall instruction.
-            # It became audible once the injection stopped force-silencing the
-            # assistant's audio stream (r10): the model now voices what it is
-            # fed, so feeding it a sentence makes it say that sentence.
+            # It became audible in conversation_logs_7 ("Please wait a minute."
+            # as an entire spoken reply) once the injection stopped
+            # force-silencing the assistant's audio stream, so it looked like
+            # noise to remove. Removing it made the next session strictly worse:
+            # three consecutive search turns produced no words at all. Those 8
+            # real tokens were the only thing interrupting a 4-second run of
+            # forced zero_text_code, and without them the text stream was
+            # conditioned into silence exactly as the audio stream had been.
             #
-            # Nothing is lost by skipping it. The wait is already covered twice
-            # over -- the thinking sound plays, and suppress_text_until_ref
-            # holds the model's words until the <ref> lands. Set
-            # LOOKUP_INJECT_ENABLED=1 to restore it.
-            if os.environ.get("LOOKUP_INJECT_ENABLED", "0").strip() == "1":
+            # It is also honest output: the assistant really is asking the user
+            # to wait while it searches. Set LOOKUP_INJECT_ENABLED=0 to skip it.
+            if os.environ.get("LOOKUP_INJECT_ENABLED", "1").strip() == "1":
                 lookup_text = (
                     search_helpers.wrap_with_lookup_tags()
                     if self.ref_lora_active else "Please wait a minute."
@@ -1833,15 +1846,51 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
                 self.pending_start_thinking = False
 
         # While a search is in flight, hand the model its own "say nothing"
-        # token instead of letting it sample text. process_transformer_output
-        # honors a provided token rather than sampling, so this is the model's
-        # native silence mechanism (the same one _step_audio_silence_core uses)
-        # -- not a hack bolted on top. Audio and hidden states keep flowing, so
-        # the avatar pipeline and chunk cadence are untouched; only the words
-        # are withheld, and they are withheld precisely while the model would
-        # otherwise be inventing an answer it is about to be handed.
+        # token instead of letting it sample text, so it cannot commit to an
+        # invented figure it is about to be handed.
+        #
+        # BOUNDED, and that bound is the whole point. This used to run for the
+        # entire search -- 4.2s, about 52 consecutive frames of forced
+        # zero_text_code -- and a long constant run conditions a stream to keep
+        # producing exactly that. It is the same failure that forcing
+        # SILENCE_TOKENS into the audio stream caused during injection, one
+        # stream over: after the <ref> landed the text stream simply stayed
+        # empty. Three consecutive search turns produced no words at all
+        # (23.6s, 21.4s, 64.8s) while every un-searched turn in the same session
+        # answered normally.
+        #
+        # Removing the <lookup> filler made it worse, which is the confirming
+        # detail: those 8 real tokens were the only thing breaking the run.
+        #
+        # A short hold still covers the moment the model would blurt a number,
+        # and the thinking sound covers whatever it says afterwards, so nothing
+        # wrong is heard either way. SUPPRESS_TEXT_MAX_SEC=0 disables the bound.
         t_lm0 = time.perf_counter()
-        if self.suppress_text_until_ref and self._step_supports_text_token:
+        suppress_now = self.suppress_text_until_ref and self._step_supports_text_token
+        if suppress_now:
+            self._suppress_text_frames += 1
+            if (
+                self._SUPPRESS_TEXT_MAX_FRAMES > 0
+                and self._suppress_text_frames > self._SUPPRESS_TEXT_MAX_FRAMES
+            ):
+                suppress_now = False
+                if self.suppress_text_until_ref:
+                    self.suppress_text_until_ref = False
+                    print(
+                        f"[liveTryPlasticity][search] text hold released after "
+                        f"{self._SUPPRESS_TEXT_MAX_FRAMES * MIMI_FRAME_SIZE / TARGET_SR:.1f}s "
+                        f"(the <ref> has not landed yet). Holding longer teaches the model to "
+                        f"stay silent; the thinking sound still covers what it says.",
+                        flush=True,
+                    )
+                    self.conv_logger.event(
+                        "text_hold_released",
+                        f"after {self._SUPPRESS_TEXT_MAX_FRAMES} frames without a <ref>",
+                        frames=self._SUPPRESS_TEXT_MAX_FRAMES,
+                    )
+        else:
+            self._suppress_text_frames = 0
+        if suppress_now:
             lm_out = self.lm_gen._step(
                 codes[:, :, :1], text_token=getattr(self.lm_gen, "zero_text_code", 3)
             )

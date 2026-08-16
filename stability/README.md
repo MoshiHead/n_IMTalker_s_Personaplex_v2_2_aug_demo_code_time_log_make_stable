@@ -1,5 +1,33 @@
 # Stability and answer quality
 
+## The one rule that matters most
+
+**Never force a long constant run into either of Moshi's streams.**
+
+Both the text stream and the audio stream are autoregressive. Force a constant
+token into one for seconds at a time and the model learns, in context, to keep
+producing exactly that — so the stream stays dead after the forcing stops. This
+single mechanism caused three separate failures, once per stream:
+
+| stream | what was forced | symptom |
+| --- | --- | --- |
+| assistant audio | 20–24 frames of `SILENCE_TOKENS` during `<ref>` injection | every injected turn produced correct text and **no voice** |
+| text | ~52 frames of `zero_text_code` across a 4.2 s search | three consecutive search turns produced **no words at all** (23.6 s, 21.4 s, 64.8 s) |
+| user audio | a sine tone during injection | the model read it as the end of a system prompt and **greeted** instead of answering |
+
+Every un-searched turn in those same sessions answered normally, which is what
+made the correlation unmistakable.
+
+`stability/test_forced_runs.py` pins the invariant: every place that forces a
+stream is bounded, counted, released, and logged.
+
+The `<lookup>` filler ("Please wait a minute") is **on** for this reason. It
+looked like noise — in one session it was the entire spoken reply — but those 8
+real tokens are the only thing interrupting the forced-text run during a search.
+Removing it silenced three turns in a row. The echo was cosmetic; the silence
+was a broken feature.
+
+
 > **Before anything else, check which code the pod is running.**
 > `grep "PIPELINE REVISION" live_server.log` must print the revision declared
 > in `IMTalker/liveTry.py`. `conversation_logs_5` reported

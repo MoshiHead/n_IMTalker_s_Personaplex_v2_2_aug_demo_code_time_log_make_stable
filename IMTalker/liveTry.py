@@ -44,7 +44,7 @@ FRAME_SIZE = 1920  # 80 ms at 24 kHz, Moshi/Mimi step size
 # code than you think is otherwise indistinguishable from a broken fix -- and
 # was: conversation_logs_5 showed `ref_lora_loaded=False` alongside injected
 # `<ref>` tags, a combination this revision cannot produce.
-PIPELINE_REVISION = "2026-08-16.r11-lookup-echo"
+PIPELINE_REVISION = "2026-08-16.r12-bounded-forced-runs"
 
 
 # ---------------------------------------------------------------------------
