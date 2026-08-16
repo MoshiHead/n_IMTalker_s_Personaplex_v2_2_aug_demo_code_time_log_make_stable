@@ -223,12 +223,20 @@ if [[ "$ENABLE_SEARCH" == "1" ]]; then
     # A config that does not match the checkpoint is the failure this guards
     # against, and it is silent by nature -- the server still starts, the
     # adapter just does not do its job.
-    if [[ -f "$PROJECT_ROOT/stability/derive_ref_lora_config.py" ]]; then
-      python "$PROJECT_ROOT/stability/derive_ref_lora_config.py" "$REF_LORA_DIR/lora" --check || {
+    # This block runs BEFORE `source "$VENV_DIR/bin/activate"` further down, so
+    # a bare `python` here is the system interpreter, not the venv's. The tool
+    # itself now needs nothing beyond the standard library, but resolve the
+    # venv interpreter anyway so it matches the one the server will run under.
+    REF_LORA_PY="$VENV_DIR/bin/python"
+    [[ -x "$REF_LORA_PY" ]] || REF_LORA_PY="$(command -v python3 || command -v python)"
+    if [[ -f "$PROJECT_ROOT/stability/derive_ref_lora_config.py" && -n "$REF_LORA_PY" ]]; then
+      "$REF_LORA_PY" "$PROJECT_ROOT/stability/derive_ref_lora_config.py" \
+        "$REF_LORA_DIR/lora" --check || {
         echo "[fix] regenerating adapter_config.json from the checkpoint..." >&2
-        python "$PROJECT_ROOT/stability/derive_ref_lora_config.py" "$REF_LORA_DIR/lora" || {
-          echo "Could not derive a matching adapter_config.json. Set REF_LORA_STRICT=0 to" >&2
-          echo "start anyway with a partially-applied adapter, or REF_LORA_ENABLED=0." >&2
+        "$REF_LORA_PY" "$PROJECT_ROOT/stability/derive_ref_lora_config.py" \
+          "$REF_LORA_DIR/lora" || {
+          echo "Could not derive a matching adapter_config.json. Start anyway with" >&2
+          echo "REF_LORA_STRICT=0 (partially-applied adapter) or REF_LORA_ENABLED=0." >&2
           exit 1
         }
       }

@@ -126,9 +126,33 @@ print("[ok] 7. it emits exact module paths, so PEFT wraps only trained modules")
 assert "--check" in tool_src and "adapter_config.json.bak" in tool_src
 print("[ok] 8. it can verify without writing, and backs up the previous config")
 
-# The launcher must run the check before starting.
+# Standard library only. The launcher runs this BEFORE activating the venv, so
+# any third-party import makes the pre-flight check fail and, under
+# REF_LORA_STRICT, stops the server from starting at all -- which is exactly
+# what "safetensors is required: pip install safetensors" did.
+imports = set()
+for n in ast.walk(ast.parse(tool_src)):
+    if isinstance(n, ast.Import):
+        imports |= {a.name.split(".")[0] for a in n.names}
+    elif isinstance(n, ast.ImportFrom) and n.module:
+        imports.add(n.module.split(".")[0])
+non_stdlib = sorted(m for m in imports if m not in sys.stdlib_module_names)
+assert not non_stdlib, (
+    f"the tool must import only the standard library, found {non_stdlib}; it runs "
+    f"before the venv is active"
+)
+assert "read_safetensors_header" in tool_src, \
+    "the safetensors header must be parsed directly, not via the package"
+print(f"[ok] 9. stdlib-only ({', '.join(sorted(imports))}) -- runs before the venv exists")
+
+# The launcher must run the check with an interpreter it can actually reach.
 assert "derive_ref_lora_config.py" in launcher and "--check" in launcher
-print("[ok] 9. the launcher verifies the config on every start")
+assert 'REF_LORA_PY="$VENV_DIR/bin/python"' in launcher, (
+    "the launcher must resolve the venv interpreter explicitly -- this block runs "
+    "before `source .../activate`, so a bare `python` is the system one"
+)
+assert '"$REF_LORA_PY" "$PROJECT_ROOT/stability/derive_ref_lora_config.py"' in launcher
+print("[ok] 10. the launcher verifies the config on every start, using the venv python")
 
 
 # ============================================== part D: the revision marker

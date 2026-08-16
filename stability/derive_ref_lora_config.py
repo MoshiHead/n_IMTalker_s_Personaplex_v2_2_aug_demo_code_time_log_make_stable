@@ -50,34 +50,61 @@ _LORA_KEY_RE = re.compile(
 )
 
 
+def read_safetensors_header(path: pathlib.Path) -> dict:
+    """Tensor names and shapes, using only the standard library.
+
+    A .safetensors file starts with a little-endian uint64 header length,
+    followed by that many bytes of JSON describing every tensor. Names and
+    shapes are all this tool needs, so there is no reason to depend on the
+    `safetensors` package -- and depending on it made the launcher's pre-flight
+    check fail outright when it ran before the venv was on PATH.
+    """
+    with path.open("rb") as f:
+        raw_len = f.read(8)
+        if len(raw_len) != 8:
+            sys.exit(f"{path} is too short to be a safetensors file")
+        header_len = int.from_bytes(raw_len, "little")
+        if not 0 < header_len < (256 << 20):
+            sys.exit(f"{path} has an implausible safetensors header length ({header_len})")
+        try:
+            header = json.loads(f.read(header_len).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as e:
+            sys.exit(f"{path} does not contain a readable safetensors header: {e}")
+    header.pop("__metadata__", None)
+    return header
+
+
 def parse_checkpoint(path: pathlib.Path) -> dict:
-    try:
-        from safetensors import safe_open
-    except ImportError:
-        sys.exit("safetensors is required: pip install safetensors")
+    header = read_safetensors_header(path)
 
     modules: dict[str, dict] = {}
     adapters: set[str] = set()
     skipped: list[str] = []
-    with safe_open(str(path), framework="pt") as f:
-        for key in f.keys():
-            m = _LORA_KEY_RE.match(key)
-            if not m:
-                skipped.append(key)
-                continue
-            name = m.group("module")
-            if m.group("adapter"):
-                adapters.add(m.group("adapter"))
-            shape = list(f.get_slice(key).get_shape())
-            modules.setdefault(name, {})[m.group("ab")] = shape
+    for key, spec in header.items():
+        m = _LORA_KEY_RE.match(key)
+        if not m:
+            skipped.append(key)
+            continue
+        name = m.group("module")
+        if m.group("adapter"):
+            adapters.add(m.group("adapter"))
+        modules.setdefault(name, {})[m.group("ab")] = list(spec.get("shape", []))
 
     ranks: set[int] = set()
     complete, incomplete = [], []
     for name, parts in sorted(modules.items()):
-        if "A" in parts and "B" in parts:
+        if "A" in parts and "B" in parts and parts["A"] and parts["B"]:
             complete.append(name)
-            # lora_A is [r, in_features]; lora_B is [out_features, r]
-            ranks.add(int(parts["A"][0]))
+            # lora_A is [r, in_features]; lora_B is [out_features, r].
+            # Cross-check the two so a transposed or malformed checkpoint is
+            # reported rather than silently producing a wrong rank.
+            r_a, r_b = int(parts["A"][0]), int(parts["B"][-1])
+            if r_a != r_b:
+                sys.exit(
+                    f"{name}: lora_A says r={r_a} but lora_B says r={r_b}. "
+                    f"This checkpoint's tensors are not a matching LoRA pair."
+                )
+            ranks.add(r_a)
         else:
             incomplete.append(name)
 
