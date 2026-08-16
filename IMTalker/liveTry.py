@@ -268,12 +268,30 @@ class MoshiOnlyEngine:
             # an incomplete Step 8 download made the repo copy win, the 7B model
             # was quietly loaded a different way for that whole pod.
             dropped = sorted(k for k in optional_kwargs if k not in supported)
+            # Same rule as the LMGen check below: a dropped kwarg only matters
+            # when its value would have changed something. `context=None` and a
+            # default num_codebooks cost nothing; a dropped quantize_4bit=True
+            # means the 7B model is being loaded a completely different way.
+            fatal_loader = [
+                k for k in dropped
+                if optional_kwargs[k] not in (None, False)
+                and not (k == "num_codebooks" and optional_kwargs[k] == 8)
+            ]
             self._runtime_contract["dropped_loader_kwargs"] = dropped
-            if dropped:
+            self._runtime_contract["fatal_loader_kwargs"] = fatal_loader
+            if dropped and not fatal_loader:
+                print(
+                    f"[liveTry] this moshi build does not accept {dropped} -- harmless here, "
+                    f"their values are defaults ("
+                    + ", ".join(f"{k}={optional_kwargs[k]!r}" for k in dropped) + ")",
+                    flush=True,
+                )
+            if fatal_loader:
                 msg = (
-                    f"This moshi build ignores {dropped}. Loaded from "
-                    f"{getattr(loaders, '__file__', '?')}, which is NOT the PersonaPlex fork "
-                    f"bundled in <personaplex_bnb4>/moshi. Re-run "
+                    f"This moshi build ignores {fatal_loader} ("
+                    + ", ".join(f"{k}={optional_kwargs[k]!r}" for k in fatal_loader) + "). "
+                    f"Loaded from {getattr(loaders, '__file__', '?')}, which is NOT the "
+                    f"PersonaPlex fork bundled in <personaplex_bnb4>/moshi. Re-run "
                     f"scripts/download_live_assets.sh and reinstall with "
                     f"`pip install -e <personaplex_bnb4>/moshi --no-deps`, or set "
                     f"ALLOW_MOSHI_FALLBACK=1 to run degraded on purpose."
@@ -300,30 +318,15 @@ class MoshiOnlyEngine:
         self.mimi.eval()
         self.lm.eval()
 
-        try:
-            from moshi.run_inference import get_condition_tensors
+        import inspect as _inspect
 
-            cond_tensors = get_condition_tensors(
-                model_type,
-                self.lm,
-                batch_size=1,
-                cfg_coef=float(cfg_coef),
-            )
-        except Exception as e:
-            # An empty dict here means the model runs with no conditioning at
-            # all. It used to be swallowed silently, so a run could be
-            # unconditioned from startup with nothing in the log to say so.
-            msg = (
-                f"get_condition_tensors unavailable ({e!r}) -- PersonaPlex would run "
-                f"UNCONDITIONED. moshi loaded from "
-                f"{self._runtime_contract.get('moshi_file', '?')}. Set "
-                f"ALLOW_MOSHI_FALLBACK=1 to run without conditioning on purpose."
-            )
-            if self.strict_runtime:
-                raise RuntimeError(msg) from e
-            print(f"[liveTry] DEGRADED: {msg}", flush=True)
-            cond_tensors = {}
+        _lmgen_params = set(_inspect.signature(LMGen.__init__).parameters)
+
+        cond_tensors, cond_status = self._resolve_condition_tensors(
+            model_type, float(cfg_coef), "condition_tensors" in _lmgen_params
+        )
         self._runtime_contract["condition_tensors"] = len(cond_tensors or {})
+        self._runtime_contract["condition_source"] = cond_status
 
         def on_text_hook(text_tokens: torch.Tensor) -> None:
             token = int(text_tokens[0].detach().item())
@@ -337,9 +340,6 @@ class MoshiOnlyEngine:
         # change them without editing this file. The TEXT stream is the one that
         # carries semantic content, so PERSONAPLEX_TEMP_TEXT / _TOP_K_TEXT are
         # the knobs to reach for when replies drift off-topic.
-        import inspect as _inspect
-
-        _lmgen_params = set(_inspect.signature(LMGen.__init__).parameters)
         sampling_kwargs = {
             "temp": float(os.environ.get("PERSONAPLEX_TEMP", "0.8")),
             "temp_text": float(os.environ.get("PERSONAPLEX_TEMP_TEXT", "0.7")),
@@ -361,23 +361,54 @@ class MoshiOnlyEngine:
             )
         self._runtime_contract["sampling"] = dict(sampling_kwargs)
 
-        # The core contract. Missing any of these means the fallback would run
-        # with no CFG, no condition tensors and no text hook (so self.sampled_text
-        # never fills) -- the same root cause as the loader kwarg filter above.
-        core_missing = sorted(
-            k for k in ("cfg_coef", "condition_tensors", "on_text_hook")
-            if k not in _lmgen_params
-        )
+        # Forks differ in which of these three they expose, and a missing kwarg
+        # is only a FAULT when something is actually lost. Judge each on that,
+        # not on its mere absence -- an over-eager check here is just a new way
+        # to fail a healthy deployment.
+        core_kwargs = {
+            "cfg_coef": float(cfg_coef),
+            "condition_tensors": cond_tensors,
+            "on_text_hook": on_text_hook,
+        }
+        core_missing = sorted(k for k in core_kwargs if k not in _lmgen_params)
+        fatal, benign = [], []
+        for k in core_missing:
+            if k == "cfg_coef" and abs(float(cfg_coef) - 1.0) > 1e-6:
+                # A CFG scale was explicitly requested and would be silently
+                # ignored. At cfg_coef == 1.0 (the launcher's default) CFG is a
+                # no-op anyway, so its absence costs nothing.
+                fatal.append(k)
+            elif k == "condition_tensors" and cond_tensors:
+                # Tensors were actually built and could not be handed over.
+                fatal.append(k)
+            else:
+                # on_text_hook only feeds the UI's sampled_text display; losing
+                # it costs a transcript panel, not answer quality.
+                benign.append(k)
+        # Anything unsupported must also be dropped from the call, or the
+        # construction below raises TypeError for a reason we already understand.
+        for k in core_missing:
+            core_kwargs.pop(k, None)
         self._runtime_contract["missing_lmgen_kwargs"] = core_missing
-        if core_missing:
+        self._runtime_contract["fatal_lmgen_kwargs"] = fatal
+        if benign:
+            print(
+                f"[liveTry] this LMGen build does not accept {benign} -- harmless in this "
+                f"configuration (cfg_coef={float(cfg_coef)}, "
+                f"condition_tensors={len(cond_tensors or {})})",
+                flush=True,
+            )
+        if fatal:
             msg = (
-                f"This LMGen build does not accept {core_missing}, so PersonaPlex would run "
-                f"with no CFG, no condition tensors and no text hook. moshi loaded from "
+                f"This LMGen build does not accept {fatal}, and this configuration needs "
+                f"them (cfg_coef={float(cfg_coef)}, "
+                f"condition_tensors={len(cond_tensors or {})}) -- they would be silently "
+                f"ignored. moshi loaded from "
                 f"{self._runtime_contract.get('moshi_file', '?')} "
-                f"(v{self._runtime_contract.get('moshi_version', '?')}), which is NOT the "
-                f"PersonaPlex fork bundled in <personaplex_bnb4>/moshi. Re-run "
+                f"(v{self._runtime_contract.get('moshi_version', '?')}). Expected the "
+                f"PersonaPlex fork bundled in <personaplex_bnb4>/moshi: re-run "
                 f"scripts/download_live_assets.sh and `pip install -e "
-                f"<personaplex_bnb4>/moshi --no-deps`, or set ALLOW_MOSHI_FALLBACK=1 to run "
+                f"<personaplex_bnb4>/moshi --no-deps`. Set ALLOW_MOSHI_FALLBACK=1 to run "
                 f"degraded on purpose."
             )
             if self.strict_runtime:
@@ -385,14 +416,8 @@ class MoshiOnlyEngine:
             print(f"[liveTry] DEGRADED: {msg}", flush=True)
 
         try:
-            self.lm_gen = LMGen(
-                self.lm,
-                cfg_coef=float(cfg_coef),
-                condition_tensors=cond_tensors,
-                on_text_hook=on_text_hook,
-                **sampling_kwargs,
-            )
-            self._runtime_contract["lmgen"] = "full"
+            self.lm_gen = LMGen(self.lm, **core_kwargs, **sampling_kwargs)
+            self._runtime_contract["lmgen"] = "full" if not core_missing else "partial"
         except TypeError as e:
             # Safety net: the signature said these were accepted, so a TypeError
             # here is something the introspection could not see.
@@ -413,17 +438,23 @@ class MoshiOnlyEngine:
         # a degraded start can no longer report green.
         print(
             f"[liveTry] runtime contract: moshi={self._runtime_contract.get('moshi_file', '?')} "
+            f"v{self._runtime_contract.get('moshi_version', '?')} "
             f"lmgen={self._runtime_contract['lmgen']} "
             f"dropped_loader_kwargs={self._runtime_contract.get('dropped_loader_kwargs', [])} "
-            f"condition_tensors={self._runtime_contract['condition_tensors']} "
+            f"condition_tensors={self._runtime_contract['condition_tensors']}"
+            f"({self._runtime_contract.get('condition_source', '?')}) "
             f"seed={self.personaplex_seed} reseed_per_session={self.reseed_per_session} "
             f"sampling={sampling_kwargs}",
             flush=True,
         )
+        # "none-declared" and "unsupported-api" are healthy: the bnb4 PersonaPlex
+        # fork ships no moshi.run_inference and the model declares no
+        # conditioners, so an empty dict is the correct answer, not a fault.
         contract_ok = (
-            self._runtime_contract["lmgen"] == "full"
-            and not self._runtime_contract.get("dropped_loader_kwargs")
-            and not self._runtime_contract.get("missing_lmgen_kwargs")
+            self._runtime_contract["lmgen"] != "fallback"
+            and not self._runtime_contract.get("fatal_loader_kwargs")
+            and not self._runtime_contract.get("fatal_lmgen_kwargs")
+            and self._runtime_contract.get("condition_source") != "missing-helper"
         )
         if contract_ok:
             print("[liveTry] PersonaPlex runtime contract OK", flush=True)
@@ -508,6 +539,111 @@ class MoshiOnlyEngine:
             web_search_has_key=bool(self.web_search_api_key),
         )
 
+    def _model_conditioners(self) -> list[str]:
+        """Names of the conditioners this LM actually declares, if any.
+
+        A model with no conditioners is correctly run with an empty
+        condition_tensors dict -- that is not a degraded state, and treating it
+        as one turns a healthy deployment into a startup crash."""
+        for attr in ("condition_provider", "conditioner_provider", "conditioners"):
+            provider = getattr(self.lm, attr, None)
+            if provider is None:
+                continue
+            conditioners = getattr(provider, "conditioners", provider)
+            with contextlib.suppress(Exception):
+                if isinstance(conditioners, dict):
+                    return sorted(conditioners.keys())
+                if hasattr(conditioners, "keys"):
+                    return sorted(conditioners.keys())
+        return []
+
+    def _resolve_condition_tensors(
+        self, model_type: str, cfg_coef: float, lmgen_accepts_conditions: bool
+    ) -> tuple[dict, str]:
+        """Build the CFG condition tensors, or establish that this build has
+        none to build.
+
+        `moshi.run_inference` is a convenience module that not every PersonaPlex
+        fork ships -- the one bundled in the bnb4 weights snapshot does not, and
+        that fork is the CORRECT one. So a missing import here says nothing on
+        its own; what matters is whether the loaded model declares conditioners
+        that are then going unused. Only that last case is a real fault.
+
+        Returns (tensors, status) where status is one of:
+          built            -- tensors were produced by a resolved helper
+          none-declared    -- the model has no conditioners; {} is correct
+          unsupported-api  -- this LMGen takes no condition_tensors at all
+          missing-helper   -- conditioners exist but no helper could build them
+        """
+        candidates = (
+            "moshi.run_inference",
+            "moshi.models.loaders",
+            "moshi.models.lm",
+            "moshi.models",
+            "moshi.conditioners",
+            "moshi.utils",
+        )
+        getter = None
+        for module_name in candidates:
+            with contextlib.suppress(Exception):
+                module = __import__(module_name, fromlist=["get_condition_tensors"])
+                getter = getattr(module, "get_condition_tensors", None)
+                if getter is not None:
+                    break
+
+        if getter is not None:
+            try:
+                tensors = getter(model_type, self.lm, batch_size=1, cfg_coef=cfg_coef)
+                print(
+                    f"[liveTry] condition tensors: {len(tensors or {})} built by "
+                    f"{getattr(getter, '__module__', '?')}.get_condition_tensors "
+                    f"(cfg_coef={cfg_coef})",
+                    flush=True,
+                )
+                return tensors or {}, "built"
+            except Exception as e:
+                tb = traceback.format_exc()
+                msg = (
+                    f"get_condition_tensors was found but failed ({e!r}); PersonaPlex would run "
+                    f"UNCONDITIONED. Set ALLOW_MOSHI_FALLBACK=1 to run anyway."
+                )
+                if self.strict_runtime:
+                    raise RuntimeError(msg) from e
+                print(f"[liveTry] DEGRADED: {msg}\n{tb}", flush=True)
+                self.conv_logger.error("condition_tensors", e, tb)
+                return {}, "missing-helper"
+
+        if not lmgen_accepts_conditions:
+            print(
+                "[liveTry] condition tensors: not applicable -- this LMGen build takes no "
+                "condition_tensors argument",
+                flush=True,
+            )
+            return {}, "unsupported-api"
+
+        conditioners = self._model_conditioners()
+        if not conditioners:
+            # The common, healthy case for the bnb4 fork: no run_inference
+            # module and no conditioners on the model, so {} is exactly right.
+            print(
+                "[liveTry] condition tensors: none -- this model declares no conditioners "
+                "(no moshi.run_inference in this build, and none needed)",
+                flush=True,
+            )
+            return {}, "none-declared"
+
+        msg = (
+            f"This model declares conditioners {conditioners} but no get_condition_tensors "
+            f"helper could be resolved (tried {list(candidates)}), so PersonaPlex would run "
+            f"UNCONDITIONED. moshi loaded from "
+            f"{self._runtime_contract.get('moshi_file', '?')}. Set ALLOW_MOSHI_FALLBACK=1 to "
+            f"run without conditioning on purpose."
+        )
+        if self.strict_runtime:
+            raise RuntimeError(msg)
+        print(f"[liveTry] DEGRADED: {msg}", flush=True)
+        return {}, "missing-helper"
+
     def _load_ref_lora(self, checkpoint_dir: str, merge_lora: bool = False) -> None:
         """Load the <lookup>/<ref> LoRA adapter onto self.lm. Unmerged by
         default (QLoRA-style: LoRA computed at forward time on top of the 4-bit
@@ -526,10 +662,69 @@ class MoshiOnlyEngine:
             if merge_lora:
                 self.lm = peft_model.merge_and_unload()
             print(f"[liveTry] reference LoRA loaded from {lora_path}", flush=True)
+            self._report_ref_lora_coverage(peft_model, lora_path)
         except Exception as e:
             tb = traceback.format_exc()
             print(f"[liveTry] reference LoRA load failed (continuing without it): {e!r}\n{tb}", flush=True)
             self.conv_logger.error("ref_lora_load", e, tb)
+
+    @torch.no_grad()
+    def _report_ref_lora_coverage(self, peft_model, lora_path) -> None:
+        """Say how much of the reference LoRA is actually doing anything.
+
+        PEFT wraps every module matching adapter_config.json's `target_modules`,
+        which for this hand-written config is a broad substring list
+        ("proj", "linear", "fc1", ...). Modules the checkpoint has no weights for
+        are still wrapped, then default-initialised with lora_A random and
+        lora_B ZERO -- so their delta is exactly zero and they are no-ops. That
+        is what PEFT's "missing adapter keys" warning about
+        depformer.*.self_attn.in_proj means: harmless, but it also means the
+        adapter covers less of the model than the config implies, and nothing
+        used to say by how much.
+        """
+        try:
+            active, inactive = [], []
+            for name, module in peft_model.named_modules():
+                lora_B = getattr(module, "lora_B", None)
+                if lora_B is None or not hasattr(lora_B, "keys"):
+                    continue
+                for adapter_name in list(lora_B.keys()):
+                    weight = getattr(lora_B[adapter_name], "weight", None)
+                    if weight is None:
+                        continue
+                    # lora_B == 0 => B @ A == 0 => this module contributes nothing.
+                    if float(weight.detach().abs().max().item()) > 0.0:
+                        active.append(name)
+                    else:
+                        inactive.append(name)
+            total = len(active) + len(inactive)
+            if not total:
+                return
+            print(
+                f"[liveTry] reference LoRA coverage: {len(active)}/{total} wrapped modules carry "
+                f"trained weights, {len(inactive)} are zero-initialised no-ops "
+                f"(PEFT wraps everything matching target_modules; the checkpoint does not "
+                f"populate all of them)",
+                flush=True,
+            )
+            if inactive:
+                sample = ", ".join(inactive[:3])
+                print(f"[liveTry] reference LoRA inactive (sample): {sample}", flush=True)
+            self.conv_logger.event(
+                "ref_lora_coverage", path=str(lora_path),
+                active_modules=len(active), inactive_modules=len(inactive), total=total,
+            )
+            if not active:
+                print(
+                    "[liveTry] WARNING every reference-LoRA module is a zero no-op -- the "
+                    "adapter is having no effect at all. Check that adapter_config.json's "
+                    "target_modules matches the checkpoint (see "
+                    "scripts/download_live_assets.sh, which writes that config by hand).",
+                    flush=True,
+                )
+        except Exception as e:
+            # Diagnostics only: never let this break startup.
+            print(f"[liveTry] reference LoRA coverage report failed (ignored): {e!r}", flush=True)
 
     def _load_stt_vad(self, stt_hf_repo: str, stt_pkg_dir: str, device) -> None:
         # Import search_helpers first, on its own, with a specific error

@@ -58,6 +58,39 @@ dropped anything, the sampling defaults in force, `torch.initial_seed()`, every
 dependency version, and the sha256 of every checkpoint resolved through the
 launcher's own precedence.
 
+## The runtime contract
+
+The server prints one line recording what it actually loaded, then
+`PersonaPlex runtime contract OK` when nothing was lost:
+
+```
+[liveTry] runtime contract: moshi=/…/personaplex_bnb4/moshi/moshi/__init__.py v0.2.x
+          lmgen=full dropped_loader_kwargs=[] condition_tensors=0(none-declared)
+          seed=42 reseed_per_session=True sampling={'temp': 0.8, …}
+[liveTry] PersonaPlex runtime contract OK
+```
+
+**A missing capability is only a fault when something is lost.** The gates are
+built on that rule, because failing on mere absence just breaks healthy pods:
+
+| `condition_source` | Meaning | Healthy? |
+| --- | --- | --- |
+| `built` | a `get_condition_tensors` helper produced them | yes |
+| `none-declared` | the model declares no conditioners, so `{}` is correct | **yes** |
+| `unsupported-api` | this LMGen takes no `condition_tensors` at all | yes |
+| `missing-helper` | conditioners exist but nothing could build them | **no** |
+
+`none-declared` is the normal result for the bnb4 fork: it ships no
+`moshi.run_inference` module, and its model has no conditioners. Likewise a
+`cfg_coef` the build cannot accept is fatal only when a scale other than `1.0`
+was requested — the launcher leaves `--moshi_cfg_coef` at `1.0`, where CFG is a
+no-op — and a dropped `quantize_4bit` is fatal only when `True` was passed.
+
+`reference LoRA coverage: N/M wrapped modules carry trained weights` explains
+PEFT's "missing adapter keys" warning: the hand-written `adapter_config.json`
+targets more modules than the checkpoint populates. The unpopulated ones get
+`lora_B = 0`, so they contribute exactly nothing — harmless, but now counted.
+
 ## Reading the server log
 
 ```bash
@@ -95,13 +128,16 @@ weights and the same source.
 ## Verifying the fixes
 
 ```bash
-python stability/test_fixes.py .
+python stability/test_fixes.py .            # seeding, gates, FM noise, wiring
+python stability/test_runtime_contract.py   # condition tensors + strict gates
 ```
 
-Checks the seed helpers make the sampling stream reproducible, that the strict
-runtime gate accepts the PersonaPlex fork and refuses the repo fork, that
+The first checks that the seed helpers reproduce the sampling stream, that
 `FM.sample` honours `noise_init` per chunk, and that the launcher scripts carry
-the contract. Needs only `torch`.
+the contract. The second replays the startup decision logic against every fork
+shape that turns up in practice — including the bnb4 fork with no
+`moshi.run_inference`, which an earlier version of the gate wrongly rejected.
+Both need only `torch`.
 
 ## What is still nondeterministic
 
